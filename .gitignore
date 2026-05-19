@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/.venv/
+
+# Run artifacts
+logs/
+wandb/
+*.zip
+*.ckpt
+*.npz
+results/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local secrets
+.env
+*.key

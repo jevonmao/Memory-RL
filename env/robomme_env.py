@@ -1,0 +1,347 @@
+"""RoboMME environment adapter.
+
+Wraps the official benchmark from https://github.com/RoboMME/robomme_benchmark
+(`robomme.env_record_wrapper.BenchmarkEnvBuilder`) behind a Gymnasium-shaped
+interface so the rest of this repo (training, eval, trajectory logger) can
+talk to it uniformly.
+
+Backends, tried in order:
+  1. The installed `robomme` package.
+  2. `$ROBOMME_PATH` — a local checkout (we prepend `<path>/src` to sys.path
+     so the `robomme` package import resolves).
+  3. A plain Gymnasium env id — only if `allow_gym_fallback=True`. Used for
+     pipeline smoke tests (e.g. `CartPole-v1`); never silently substituted.
+
+Important RoboMME-specific behavior (per doc/env_format.md):
+  * `BenchmarkEnvBuilder.make_env_for_episode(ep)` creates an env bound to
+    a single fixed episode. To support multi-episode rollouts (PPO needs
+    many resets), this wrapper rebuilds the inner env each `reset()`,
+    cycling through `episode_idx` mod `episode_num`.
+  * Observations are `dict[str, list]` — every value is a list of frames
+    over the last sub-step window. With `flatten_obs=True` (default) we
+    take the latest entry of each requested key and concatenate the
+    numeric ones into a single 1-D float32 vector for use with MlpPolicy.
+    With `flatten_obs=False` the raw dict is forwarded (you must use a
+    custom policy that understands it).
+  * Per the RoboMME docs the scalar `reward` is currently unused (the
+    benchmark targets imitation learning). For PPO baselines you'll
+    therefore see ~zero extrinsic reward; this is exactly the motivation
+    for the curiosity/memory modules. See README "Known issues".
+"""
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "gymnasium is required. Install with: pip install -r requirements.txt"
+    ) from e
+
+
+SETUP_HINT = (
+    "Could not locate the RoboMME benchmark. Options:\n"
+    "  1. Clone https://github.com/RoboMME/robomme_benchmark and `uv pip install -e .`\n"
+    "     (or use the Dockerfile in that repo).\n"
+    "  2. Set ROBOMME_PATH=/abs/path/to/robomme_benchmark — this adapter\n"
+    "     prepends <ROBOMME_PATH>/src to sys.path so `import robomme` works.\n"
+    "  3. For pipeline smoke tests only, pass allow_gym_fallback=True and use a\n"
+    "     Gymnasium env id as task_name (e.g. CartPole-v1)."
+)
+
+ROBOMME_TASKS: List[str] = [
+    "BinFill", "PickXtimes", "SwingXtimes", "StopCube",
+    "VideoUnmask", "VideoUnmaskSwap", "ButtonUnmask", "ButtonUnmaskSwap",
+    "PickHighlight", "VideoRepick", "VideoPlaceButton", "VideoPlaceOrder",
+    "MoveCube", "InsertPeg", "PatternLock", "RouteStick",
+]
+
+# Numeric observation keys we use when `flatten_obs=True`.
+_DEFAULT_FLATTEN_KEYS = ("eef_state_list", "joint_state_list", "gripper_state_list")
+
+
+def _try_import_robomme():
+    try:
+        return importlib.import_module("robomme")
+    except ImportError:
+        pass
+    path = os.environ.get("ROBOMME_PATH")
+    if path:
+        for candidate in (os.path.join(path, "src"), path):
+            if os.path.isdir(candidate) and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+        try:
+            return importlib.import_module("robomme")
+        except ImportError:
+            return None
+    return None
+
+
+def list_tasks() -> List[str]:
+    robomme = _try_import_robomme()
+    if robomme is not None:
+        try:
+            from robomme.env_record_wrapper import BenchmarkEnvBuilder
+            return list(BenchmarkEnvBuilder.get_task_list())
+        except Exception:
+            pass
+    return list(ROBOMME_TASKS)
+
+
+@dataclass
+class EnvMetadata:
+    task_name: str
+    backend: str
+    max_episode_steps: Optional[int]
+    extra: Dict[str, Any]
+
+
+class _FlattenLatestObs:
+    """Take the last item of each list-valued obs key and concatenate numeric ones.
+
+    Produces a single float32 vector observation + a Box space. Image keys
+    (`*_rgb_list`, `*_depth_list`, `maniskill_obs`) are skipped; if you need
+    pixels, set `flatten_obs=False` and provide a custom policy.
+    """
+
+    def __init__(self, keys: Sequence[str] = _DEFAULT_FLATTEN_KEYS):
+        self.keys = tuple(keys)
+        self._dim: Optional[int] = None
+
+    def _vec(self, obs: Dict[str, Any]) -> np.ndarray:
+        parts: List[np.ndarray] = []
+        for k in self.keys:
+            v = obs.get(k)
+            if v is None:
+                continue
+            arr = np.asarray(v[-1] if isinstance(v, (list, tuple)) else v).astype(np.float32).flatten()
+            parts.append(arr)
+        if not parts:
+            raise RuntimeError(
+                f"None of the requested keys {self.keys} were present in obs."
+            )
+        return np.concatenate(parts, axis=0)
+
+    def transform(self, obs: Dict[str, Any]) -> np.ndarray:
+        v = self._vec(obs)
+        if self._dim is None:
+            self._dim = v.shape[0]
+        return v
+
+    def space(self, sample_obs: Dict[str, Any]) -> spaces.Box:
+        v = self._vec(sample_obs)
+        self._dim = v.shape[0]
+        return spaces.Box(low=-np.inf, high=np.inf, shape=(v.shape[0],), dtype=np.float32)
+
+
+_ACTION_DIMS = {
+    "joint_angle": 8,   # 7 joints + gripper
+    "ee_pose": 7,       # xyz + rpy + gripper
+    "waypoint": 7,      # same as ee_pose, discrete keyframes
+}
+
+
+def _action_space_for(name: str) -> spaces.Space:
+    if name in _ACTION_DIMS:
+        d = _ACTION_DIMS[name]
+        return spaces.Box(low=-np.inf, high=np.inf, shape=(d,), dtype=np.float32)
+    raise ValueError(
+        f"action_space '{name}' is not supported by the Gym-compatible wrapper "
+        f"(supported: {sorted(_ACTION_DIMS)}). For multi_choice use the raw env."
+    )
+
+
+class RoboMMEEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"]}
+
+    def __init__(
+        self,
+        task_name: str,
+        seed: Optional[int] = None,
+        render_mode: Optional[str] = None,
+        allow_gym_fallback: bool = False,
+        dataset: str = "train",
+        action_space: str = "joint_angle",
+        max_steps: int = 300,
+        episode_idx: Optional[int] = None,
+        flatten_obs: bool = True,
+        flatten_keys: Sequence[str] = _DEFAULT_FLATTEN_KEYS,
+        builder_kwargs: Optional[Dict[str, Any]] = None,
+        episode_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+        self.task_name = task_name
+        self._render_mode = render_mode
+        self._dataset = dataset
+        self._action_space_name = action_space
+        self._max_steps = max_steps
+        self._fixed_episode_idx = episode_idx
+        self._flatten_obs = flatten_obs
+        self._flattener = _FlattenLatestObs(flatten_keys) if flatten_obs else None
+        self._builder_kwargs = dict(builder_kwargs or {})
+        self._episode_kwargs = dict(episode_kwargs or {})
+        self._next_ep_cursor = 0
+        self._inner = None
+        self._builder = None
+        self._episode_num: Optional[int] = None
+        self._backend, self._builder, _gym_env = self._init_backend(allow_gym_fallback)
+
+        if self._backend == "gymnasium-fallback":
+            self._inner = _gym_env
+            self.observation_space = self._inner.observation_space
+            self.action_space = self._inner.action_space
+        else:
+            self._inner = self._open_new_episode(self._select_episode(seed))
+            sample, _ = self._inner.reset()
+            if self._flattener is not None:
+                self.observation_space = self._flattener.space(sample)
+            else:
+                # Best-effort: expose a Dict space with float Boxes for known numeric keys
+                self.observation_space = self._infer_dict_space(sample)
+            self.action_space = _action_space_for(action_space)
+
+        self.metadata_info = EnvMetadata(
+            task_name=task_name,
+            backend=self._backend,
+            max_episode_steps=max_steps if self._backend == "robomme" else
+                (getattr(self._inner.spec, "max_episode_steps", None)
+                 if getattr(self._inner, "spec", None) is not None else None),
+            extra={
+                "dataset": dataset,
+                "action_space": action_space,
+                "episode_num": self._episode_num,
+            },
+        )
+
+    def _init_backend(self, allow_gym_fallback: bool) -> Tuple[str, Any, Any]:
+        robomme = _try_import_robomme()
+        if robomme is not None:
+            from robomme.env_record_wrapper import BenchmarkEnvBuilder
+            builder = BenchmarkEnvBuilder(
+                env_id=self.task_name,
+                dataset=self._dataset,
+                action_space=self._action_space_name,
+                gui_render=(self._render_mode == "human"),
+                max_steps=self._max_steps,
+                **self._builder_kwargs,
+            )
+            self._episode_num = int(builder.get_episode_num())
+            return "robomme", builder, None
+        if allow_gym_fallback:
+            try:
+                env = gym.make(self.task_name, render_mode=self._render_mode)
+                return "gymnasium-fallback", None, env
+            except Exception as e:
+                raise ImportError(
+                    f"Gymnasium fallback for task '{self.task_name}' failed: {e}.\n"
+                    + SETUP_HINT
+                ) from e
+        raise ImportError(SETUP_HINT)
+
+    def _select_episode(self, seed: Optional[int]) -> int:
+        if self._fixed_episode_idx is not None:
+            return int(self._fixed_episode_idx) % max(1, self._episode_num or 1)
+        if seed is not None and self._episode_num:
+            ep = int(seed) % self._episode_num
+            self._next_ep_cursor = (ep + 1) % self._episode_num
+            return ep
+        ep = self._next_ep_cursor
+        if self._episode_num:
+            self._next_ep_cursor = (self._next_ep_cursor + 1) % self._episode_num
+        return ep
+
+    def _open_new_episode(self, episode_idx: int):
+        if hasattr(self._inner, "close"):
+            try:
+                self._inner.close()
+            except Exception:
+                pass
+        return self._builder.make_env_for_episode(episode_idx, **self._episode_kwargs)
+
+    def _infer_dict_space(self, sample: Dict[str, Any]) -> spaces.Dict:
+        out: Dict[str, spaces.Space] = {}
+        for k, v in sample.items():
+            try:
+                arr = np.asarray(v[-1] if isinstance(v, (list, tuple)) else v)
+                if arr.dtype.kind in "fiu" and arr.ndim <= 3:
+                    out[k] = spaces.Box(low=-np.inf, high=np.inf, shape=arr.shape, dtype=arr.dtype)
+            except Exception:
+                continue
+        return spaces.Dict(out)
+
+    def _post(self, obs):
+        if self._flattener is not None and isinstance(obs, dict):
+            return self._flattener.transform(obs)
+        return obs
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        if self._backend == "robomme":
+            ep = self._select_episode(seed)
+            self._inner = self._open_new_episode(ep)
+            obs, info = self._inner.reset()
+            info = dict(info) if isinstance(info, dict) else {}
+            info["episode_idx"] = ep
+            return self._post(obs), info
+        return self._inner.reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self._inner.step(action)
+        if self._backend == "robomme":
+            reward = float(np.asarray(reward).item() if hasattr(reward, "item") else reward or 0.0)
+            terminated = bool(np.asarray(terminated).item() if hasattr(terminated, "item") else terminated)
+            truncated = bool(np.asarray(truncated).item() if hasattr(truncated, "item") else truncated)
+        return self._post(obs), reward, terminated, truncated, info
+
+    def render(self):
+        return self._inner.render() if hasattr(self._inner, "render") else None
+
+    def close(self):
+        if hasattr(self._inner, "close"):
+            self._inner.close()
+
+    @property
+    def unwrapped(self):
+        return self._inner.unwrapped if hasattr(self._inner, "unwrapped") else self._inner
+
+
+def make_env(
+    task_name: str,
+    seed: Optional[int] = None,
+    render_mode: Optional[str] = None,
+    allow_gym_fallback: bool = False,
+    env_kwargs: Optional[Dict[str, Any]] = None,
+) -> RoboMMEEnv:
+    env_kwargs = dict(env_kwargs or {})
+    return RoboMMEEnv(
+        task_name=task_name,
+        seed=seed,
+        render_mode=render_mode,
+        allow_gym_fallback=allow_gym_fallback,
+        **env_kwargs,
+    )
+
+
+def describe_space(space) -> Dict[str, Any]:
+    if isinstance(space, spaces.Box):
+        return {
+            "type": "Box",
+            "shape": tuple(space.shape),
+            "dtype": str(space.dtype),
+            "low": float(np.min(space.low)) if np.isfinite(space.low).all() else None,
+            "high": float(np.max(space.high)) if np.isfinite(space.high).all() else None,
+        }
+    if isinstance(space, spaces.Discrete):
+        return {"type": "Discrete", "n": int(space.n)}
+    if isinstance(space, spaces.Dict):
+        return {"type": "Dict", "spaces": {k: describe_space(v) for k, v in space.spaces.items()}}
+    if isinstance(space, spaces.Tuple):
+        return {"type": "Tuple", "spaces": [describe_space(s) for s in space.spaces]}
+    return {"type": type(space).__name__, "repr": repr(space)}
