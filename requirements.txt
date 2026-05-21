@@ -5,3 +5,4 @@ stable-baselines3>=2.3
 pyyaml>=6.0
 tensorboard>=2.14
 tqdm>=4.66
+huggingface_hub>=0.26

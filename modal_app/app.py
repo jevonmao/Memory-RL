@@ -4,28 +4,29 @@ Why this exists
 ---------------
 SAPIEN/ManiSkill require a Vulkan ICD that WSL2 doesn't expose. Modal's
 containers run on real Linux with proper NVIDIA Vulkan drivers, so we ship
-training there.
+training there. RoboMME source is cloned into the image at build time;
+datasets and run outputs are persisted on a Modal Volume — no local
+directories beyond this repo are required.
 
-Usage (from the host, after `modal token new` and `modal secret create wandb ...`):
+Workflow
+--------
+    # One-time: download RoboMME episode datasets onto the Modal volume.
+    modal run modal_app/app.py::download_data
 
-    # Smoke test — does RoboMME import + step on Modal?
+    # Verify RoboMME imports and the env steps correctly on Modal.
     modal run modal_app/app.py::smoke --task BinFill
 
-    # Random-policy baseline eval
-    modal run modal_app/app.py::random_baseline --task BinFill --episodes 20
-
-    # Single PPO run
+    # Single PPO training run (outputs saved to volume).
     modal run modal_app/app.py::train_ppo --task BinFill --seed 0 --steps 100000
 
-    # Full baseline sweep (4 tasks x 3 seeds)
-    modal run modal_app/app.py::sweep
+    # Evaluate the saved checkpoint from a training run.
+    modal run modal_app/app.py::evaluate --task BinFill --seed 0
 
-Layout
-------
-We mirror RoboMME's Dockerfile recipe (CUDA 12.8 base + libvulkan1 + the
-pinned mani-skill rev) so SAPIEN renders with Vulkan. The repo and the
-robomme checkout are added as Mounts so we can iterate on training code
-locally without rebuilding the image.
+    # Random-policy sanity check (no training required).
+    modal run modal_app/app.py::random_baseline --task BinFill --episodes 20
+
+    # Full baseline sweep: 4 tasks x 3 seeds in parallel.
+    modal run modal_app/app.py::sweep
 """
 from __future__ import annotations
 
@@ -36,7 +37,18 @@ from pathlib import Path
 import modal
 
 # ---------------------------------------------------------------------------
-# Image: matches robomme_benchmark/Dockerfile
+# Persistent volume — survives between function calls and across modal runs.
+#   /vol/robomme_data  — downloaded RoboMME episode datasets
+#   /vol/logs          — PPO checkpoints, TensorBoard, eval metrics
+# ---------------------------------------------------------------------------
+volume = modal.Volume.from_name("memory-rl-data", create_if_missing=True)
+VOLUME_PATH = "/vol"
+DATA_DIR = f"{VOLUME_PATH}/robomme_data"
+LOGS_DIR = f"{VOLUME_PATH}/logs"
+
+# ---------------------------------------------------------------------------
+# Image — CUDA 12.8 base, Vulkan ICD, all Python deps, RoboMME source.
+# RoboMME is cloned at image-build time so no local checkout is needed.
 # ---------------------------------------------------------------------------
 ROBOMME_REV = "07be6fbc66350ddca200abfb0a11b692f078f7fd"
 
@@ -47,7 +59,7 @@ image = (
     )
     .apt_install(
         "build-essential",
-        "clang",  # toppra (mani-skill dep) hardcodes clang for its Cython ext.
+        "clang",              # toppra (mani-skill dep) hardcodes clang for its Cython ext
         "ca-certificates",
         "curl",
         "ffmpeg",
@@ -55,14 +67,22 @@ image = (
         "libegl1",
         "libgl1",
         "libglib2.0-0",
-        "libvulkan1",
-        "vulkan-tools",
+        "libglvnd0",
+        "libvulkan1",         # Vulkan loader
+        "mesa-vulkan-drivers", # lavapipe CPU Vulkan — Modal GPU containers don't expose NVIDIA Vulkan graphics;
+                              # lavapipe lets SAPIEN's render system initialise without a GPU graphics stack.
+                              # Physics still runs on GPU via CUDA.
+        "vulkan-tools",       # vulkaninfo for diagnostics
         "libxext6",
         "libxrender1",
     )
+    .run_commands(
+        # Pre-create dirs that SAPIEN's _vulkan_tricks.py tries to write ICD patches into at
+        # runtime. Without them the silent write fails and SAPIEN falls back to nothing.
+        "mkdir -p /etc/vulkan/icd.d /etc/vulkan/implicit_layer.d /etc/glvnd/egl_vendor.d",
+    )
     .pip_install(
-        # Pinned per RoboMME pyproject — these versions are picked to be
-        # mutually compatible with mani-skill 3.0.0b21.
+        # Pinned per RoboMME pyproject — mutually compatible with mani-skill 3.0.0b21.
         "torch==2.9.1",
         "torchvision==0.24.1",
         f"mani-skill @ git+https://github.com/YinpeiDai/ManiSkill.git@{ROBOMME_REV}",
@@ -72,86 +92,319 @@ image = (
         "tensorboard",
         "pyyaml",
         "wandb>=0.18",
+        "huggingface_hub>=0.26",  # for snapshot_download of robomme_data_h5
+    )
+    .run_commands(
+        "git clone https://github.com/RoboMME/robomme_benchmark /robomme_src",
+        "cd /robomme_src && pip install -e .",
     )
     .env(
         {
-            "NVIDIA_DRIVER_CAPABILITIES": "compute,graphics,utility,video",
-            "SAPIEN_RENDER_DEVICE": "cuda",
+            # graphics/video capabilities are not needed — lavapipe handles Vulkan in software.
+            # compute is needed for CUDA physics (PhysX); utility for nvidia-smi / diagnostics.
+            "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            # Point both env-var spellings at lavapipe so the Vulkan loader never tries
+            # libGLX_nvidia.so.0, which fails in Modal's container environment.
+            "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json",
+            "VK_DRIVER_FILES":  "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json",
+            "SAPIEN_RENDER_DEVICE": "0",
             "PYTHONUNBUFFERED": "1",
             "WANDB_PROJECT": "memory-rl",
         }
     )
 )
 
+# This repo's training code is uploaded from your local working copy each run.
+# Only this directory needs to exist locally — no other local paths required.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ROBOMME_SRC = Path("/home/jevon/projects/robomme_benchmark")
-
-# Modal 1.x: bake source dirs into the image (rebuild-free across runs because
-# Modal hashes contents — only changed files trigger a layer rebuild).
 image = image.add_local_dir(str(REPO_ROOT), remote_path="/workspace")
-image = image.add_local_dir(str(ROBOMME_SRC), remote_path="/robomme_src")
 
 app = modal.App("memory-rl")
 
-GPU = "A10G"  # cheapest GPU on Modal that comfortably runs SAPIEN; bump to A100 for big sweeps.
+GPU = "A10G"  # cheapest Modal GPU that comfortably runs SAPIEN; bump to A100 for sweeps
 WANDB_SECRET = modal.Secret.from_name("wandb")
 
+# Environment variables set inside every Modal function.
 COMMON_ENV = {
     "ROBOMME_PATH": "/robomme_src",
+    "ROBOMME_DATA_DIR": DATA_DIR,   # picked up by env/robomme_env.py → BenchmarkEnvBuilder
+    "MANI_SKILL_DATA": DATA_DIR,    # ManiSkill 3 standard data path
+    "MS_ASSET_DIR": DATA_DIR,       # ManiSkill 3 asset path (demos + meshes)
     "PYTHONPATH": "/workspace:/robomme_src/src",
 }
 
 
-# ---------------------------------------------------------------------------
-# Functions
-# ---------------------------------------------------------------------------
-@app.function(image=image, gpu=GPU, timeout=600)
-def smoke(task: str = "BinFill") -> str:
-    """Confirm RoboMME imports + steps on Modal."""
+def _setup():
+    """Bootstrap sys.path inside a Modal container. Call at the top of every function."""
     os.environ.update(COMMON_ENV)
     sys.path.insert(0, "/workspace")
+    sys.path.insert(0, "/robomme_src/src")
+
+
+# ---------------------------------------------------------------------------
+# download_data — run once to populate the volume before training
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=None,           # no GPU needed for a plain file download
+    timeout=60 * 60,
+    volumes={VOLUME_PATH: volume},
+)
+def download_data(tasks: str = "BinFill,PickXtimes,SwingXtimes,StopCube"):
+    """Download RoboMME episode datasets from HuggingFace to the Modal volume.
+
+    Source: https://huggingface.co/datasets/Yinpei/robomme_data_h5
+
+    Must be run once before train_ppo, evaluate, or smoke. Data persists on
+    the volume across all future runs so this only needs to be run once (or
+    again if you want to refresh the data).
+
+    Args:
+        tasks: Comma-separated task names to download. Defaults to the four
+               Counting suite tasks (BinFill, PickXtimes, SwingXtimes,
+               StopCube). Pass "all" to download the full 16-task dataset.
+               Partial downloads use allow_patterns so only matching
+               archives are fetched.
+
+    If the HuggingFace repo is private, create a Modal secret first:
+        modal secret create huggingface HF_TOKEN=<your_token>
+    and add secrets=[modal.Secret.from_name("huggingface")] to this function.
+    """
+    import tarfile
+
+    from huggingface_hub import snapshot_download
+
+    _setup()
+    volume.reload()
+
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Build allow_patterns to fetch only requested tasks.
+    # HF repo structure: record_dataset_<TaskName>.h5.tar.xz (flat at repo root)
+    if tasks.strip().lower() == "all":
+        allow_patterns = None   # download everything
+    else:
+        task_list = [t.strip() for t in tasks.split(",") if t.strip()]
+        allow_patterns = [f"record_dataset_{t}.h5.tar.xz" for t in task_list]
+        print(f"[download_data] filtering to tasks: {task_list}")
+
+    print(f"[download_data] downloading Yinpei/robomme_data_h5 → {DATA_DIR} ...")
+    snapshot_download(
+        repo_id="Yinpei/robomme_data_h5",
+        repo_type="dataset",
+        local_dir=DATA_DIR,
+        local_dir_use_symlinks=False,  # write real files to volume; symlinks break after container exit
+        allow_patterns=allow_patterns,
+        ignore_patterns=["*.gitattributes", ".gitattributes", "README.md"],
+        token=os.environ.get("HF_TOKEN"),   # None is fine for public repos
+    )
+
+    # Extract all downloaded .tar.xz archives in-place.
+    archives = sorted(Path(DATA_DIR).glob("*.tar.xz"))
+    print(f"[download_data] extracting {len(archives)} archive(s) ...")
+    for archive in archives:
+        print(f"  extracting {archive.name} ...")
+        with tarfile.open(archive, "r:xz") as tf:
+            tf.extractall(DATA_DIR)
+
+    # List what was extracted so the caller can verify.
+    downloaded = sorted(str(p) for p in Path(DATA_DIR).rglob("*.h5"))
+    print(f"[download_data] done — {len(downloaded)} .h5 files in {DATA_DIR}")
+    for p in downloaded[:20]:
+        print(f"  {p}")
+    if len(downloaded) > 20:
+        print(f"  ... and {len(downloaded) - 20} more")
+
+    volume.commit()
+    return {"data_dir": DATA_DIR, "num_h5_files": len(downloaded)}
+
+
+# ---------------------------------------------------------------------------
+# smoke — verify RoboMME imports and can step the env
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=600,
+    volumes={VOLUME_PATH: volume},
+)
+def smoke(task: str = "BinFill") -> dict:
+    """Confirm RoboMME imports + env steps correctly on Modal."""
+    import subprocess
+
+    _setup()
+    volume.reload()
+
+    # Vulkan diagnostic — runs before SAPIEN import so we see raw driver state.
+    # Expected: lavapipe (CPU Vulkan) reported as the active device.
+    print("[smoke] vulkaninfo --summary:")
+    r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True)
+    print(r.stdout or "(no stdout)")
+    if r.returncode != 0:
+        print(f"[smoke] vulkaninfo FAILED (exit {r.returncode}):\n{r.stderr}")
+    else:
+        print("[smoke] vulkaninfo OK")
+
     from scripts.inspect_env import main as inspect_main  # type: ignore
 
     sys.argv = ["inspect_env", "--task", task]
     rc = inspect_main()
-    return f"inspect_env exit={rc}"
+    return {"task": task, "exit_code": rc}
 
 
-@app.function(image=image, gpu=GPU, timeout=3 * 60 * 60, secrets=[WANDB_SECRET])
+# ---------------------------------------------------------------------------
+# train_ppo — single PPO run, outputs saved to the volume
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=3 * 60 * 60,
+    secrets=[WANDB_SECRET],
+    volumes={VOLUME_PATH: volume},
+)
 def train_ppo(
     task: str = "BinFill",
     seed: int = 0,
     steps: int = 100_000,
     tag: str | None = None,
-):
-    """Run a single PPO baseline on Modal, logging to W&B."""
-    os.environ.update(COMMON_ENV)
-    sys.path.insert(0, "/workspace")
+) -> dict:
+    """Train a vanilla PPO baseline and save checkpoints to the volume.
 
-    import wandb  # noqa: F401 — ensures secret is wired before training imports
+    Returns a dict with the run directory path so evaluate() can find it.
+    """
+    _setup()
+    volume.reload()
+
+    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+    import wandb  # noqa: F401 — ensures WANDB_API_KEY secret is wired before SB3 imports
 
     from training.train_ppo import main as train_main  # type: ignore
 
-    argv = [
+    sys.argv = [
         "train_ppo",
         "--config", "/workspace/configs/ppo.yaml",
         "--task", task,
         "--seed", str(seed),
         "--total_steps", str(steps),
-        "--output_dir", "/workspace/logs",
+        "--output_dir", LOGS_DIR,
     ]
     if tag:
-        argv += ["--tag", tag]
-    sys.argv = argv
-    return train_main()
+        sys.argv += ["--tag", tag]
+
+    train_main()
+    volume.commit()
+
+    # Find the run dir by modification time — train_main creates it with a live timestamp.
+    run_dirs = sorted(Path(LOGS_DIR).glob(f"{task}_seed{seed}_*"), key=lambda p: p.stat().st_mtime)
+    run_name = run_dirs[-1].name if run_dirs else None
+    return {"task": task, "seed": seed, "run_name": run_name, "logs_dir": LOGS_DIR}
 
 
-@app.function(image=image, gpu=GPU, timeout=60 * 60)
-def random_baseline(task: str = "BinFill", episodes: int = 20, seed: int = 0):
-    """Random-policy eval baseline. Useful for sanity-checking the metrics
-    pipeline on RoboMME before any learned policy gets involved."""
-    os.environ.update(COMMON_ENV)
-    sys.path.insert(0, "/workspace")
+# ---------------------------------------------------------------------------
+# evaluate — load a saved checkpoint from the volume and compute metrics
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=60 * 60,
+    volumes={VOLUME_PATH: volume},
+)
+def evaluate(
+    task: str = "BinFill",
+    seed: int = 0,
+    episodes: int = 20,
+    run_name: str | None = None,
+    random: bool = False,
+) -> dict:
+    """Evaluate a PPO checkpoint (or random policy) from the volume.
+
+    Args:
+        task:      RoboMME task name.
+        seed:      Seed used during training (used to locate the run dir).
+        episodes:  Number of evaluation episodes.
+        run_name:  Exact run directory name inside the volume logs dir.
+                   If None, the most recently modified run for (task, seed)
+                   is used automatically.
+        random:    If True, run a random policy instead of loading a checkpoint.
+
+    Returns metrics dict (success_rate, average_return, etc.).
+    """
+    import json
+
+    _setup()
+    volume.reload()
+
+    from training.evaluate import main as eval_main  # type: ignore
+
+    if random:
+        checkpoint_args = ["--random"]
+    else:
+        logs_path = Path(LOGS_DIR)
+        if run_name:
+            run_dir = logs_path / run_name
+        else:
+            candidates = sorted(
+                logs_path.glob(f"{task}_seed{seed}_*"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if not candidates:
+                raise FileNotFoundError(
+                    f"No run dirs found for task={task} seed={seed} in {LOGS_DIR}. "
+                    "Run train_ppo first."
+                )
+            run_dir = candidates[-1]
+
+        checkpoint = run_dir / "checkpoints" / "ppo_final.zip"
+        if not checkpoint.exists():
+            checkpoint = run_dir / "checkpoints" / "best" / "best_model.zip"
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"No checkpoint found in {run_dir / 'checkpoints'}")
+
+        print(f"[evaluate] checkpoint: {checkpoint}")
+        checkpoint_args = ["--checkpoint", str(checkpoint)]
+
+    out_dir = Path(LOGS_DIR) / f"eval_{task}_seed{seed}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sys.argv = [
+        "evaluate",
+        *checkpoint_args,
+        "--task", task,
+        "--seed", str(seed),
+        "--episodes", str(episodes),
+        "--save_trajectories",
+        "--out_dir", str(out_dir),
+    ]
+    eval_main()
+    volume.commit()
+
+    metrics_path = out_dir / "metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path) as f:
+            return json.load(f)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# random_baseline — sanity-check metrics before any training
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=60 * 60,
+    volumes={VOLUME_PATH: volume},
+)
+def random_baseline(task: str = "BinFill", episodes: int = 20, seed: int = 0) -> dict:
+    """Run a random policy and return metrics. No training or data download needed."""
+    _setup()
+    volume.reload()
+
     from env.robomme_env import make_env  # type: ignore
     from metrics.evaluation import EpisodeRecord, summarize  # type: ignore
 
@@ -171,15 +424,31 @@ def random_baseline(task: str = "BinFill", episodes: int = 20, seed: int = 0):
     return summarize(records)
 
 
+# ---------------------------------------------------------------------------
+# sweep — 4 tasks x 3 seeds in parallel, then evaluate each
+# ---------------------------------------------------------------------------
+
 @app.local_entrypoint()
 def sweep(steps: int = 100_000):
-    """4 tasks x 3 seeds. Runs in parallel on Modal."""
+    """Train 4 tasks x 3 seeds in parallel on Modal, then evaluate each."""
     tasks = ["BinFill", "PickXtimes", "StopCube", "VideoUnmask"]
     seeds = [0, 1, 2]
     jobs = [(t, s) for t in tasks for s in seeds]
-    print(f"[sweep] launching {len(jobs)} runs on Modal ({GPU})")
-    results = list(
+
+    print(f"[sweep] launching {len(jobs)} training runs on Modal ({GPU}) ...")
+    train_results = list(
         train_ppo.starmap([(t, s, steps, "baseline") for t, s in jobs])
     )
-    for (t, s), r in zip(jobs, results):
-        print(f"[sweep] {t} seed={s} -> {r}")
+
+    print("[sweep] training done — running evaluation ...")
+    eval_results = list(
+        evaluate.starmap(
+            [(r["task"], r["seed"], 20, r["run_name"]) for r in train_results]
+        )
+    )
+
+    print("\n[sweep] results:")
+    for (t, s), metrics in zip(jobs, eval_results):
+        sr = metrics.get("success_rate", float("nan"))
+        ret = metrics.get("average_return", float("nan"))
+        print(f"  {t:20s} seed={s}  success_rate={sr:.3f}  avg_return={ret:.3f}")

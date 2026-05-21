@@ -33,4 +33,4 @@ deterministic_torch: false
 
 output_dir: logs
 policy: MlpPolicy
-device: cpu
+device: auto

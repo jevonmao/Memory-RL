@@ -225,14 +225,40 @@ class RoboMMEEnv(gym.Env):
         robomme = _try_import_robomme()
         if robomme is not None:
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
-            builder = BenchmarkEnvBuilder(
-                env_id=self.task_name,
-                dataset=self._dataset,
-                action_space=self._action_space_name,
-                gui_render=(self._render_mode == "human"),
-                max_steps=self._max_steps,
-                **self._builder_kwargs,
-            )
+            builder_kwargs = dict(self._builder_kwargs)
+            # Inject downloaded HDF5 data directory from env var if not already
+            # set by the caller. Set by modal_app/app.py COMMON_ENV via
+            # ROBOMME_DATA_DIR → /vol/robomme_data (the Modal volume).
+            data_dir = os.environ.get("ROBOMME_DATA_DIR")
+            if data_dir and "data_dir" not in builder_kwargs:
+                builder_kwargs["data_dir"] = data_dir
+            try:
+                builder = BenchmarkEnvBuilder(
+                    env_id=self.task_name,
+                    dataset=self._dataset,
+                    action_space=self._action_space_name,
+                    gui_render=(self._render_mode == "human"),
+                    max_steps=self._max_steps,
+                    **builder_kwargs,
+                )
+            except TypeError as e:
+                if "data_dir" in str(e) and data_dir:
+                    # BenchmarkEnvBuilder doesn't accept data_dir — retry without it.
+                    # Check /robomme_src/README.md for the correct data path parameter.
+                    print(f"[robomme_env] WARNING: data_dir kwarg rejected ({e}). "
+                          "Retrying without it — set ROBOMME_DATA_DIR correctly or "
+                          "pass the right kwarg via builder_kwargs.")
+                    builder_kwargs.pop("data_dir", None)
+                    builder = BenchmarkEnvBuilder(
+                        env_id=self.task_name,
+                        dataset=self._dataset,
+                        action_space=self._action_space_name,
+                        gui_render=(self._render_mode == "human"),
+                        max_steps=self._max_steps,
+                        **builder_kwargs,
+                    )
+                else:
+                    raise
             self._episode_num = int(builder.get_episode_num())
             return "robomme", builder, None
         if allow_gym_fallback:
