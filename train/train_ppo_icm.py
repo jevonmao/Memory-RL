@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
 
 from train.envs.rl_env import RobommeRLEnv
@@ -55,7 +58,8 @@ def main():
             return RobommeRLEnv(env_id=args.task, seed=args.seed + rank)
         return _init
 
-    vec_env = SubprocVecEnv([make_env(i) for i in range(args.n_envs)])
+    VecEnvCls = DummyVecEnv if platform.system() == "Windows" else SubprocVecEnv
+    vec_env = VecEnvCls([make_env(i) for i in range(args.n_envs)])
 
     policy_kwargs = dict(
         features_extractor_class=RobommeCNNExtractor,

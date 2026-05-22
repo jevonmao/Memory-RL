@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
+
+# Fix CUDA allocator fragmentation (SAPIEN Vulkan holds VRAM outside PyTorch's view)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback
 
 from train.envs.rl_env import RobommeRLEnv
 from train.models.encoder import RobommeCNNExtractor
@@ -45,7 +48,9 @@ def main():
             return RobommeRLEnv(env_id=args.task, seed=args.seed + rank)
         return _init
 
-    vec_env = SubprocVecEnv([make_env(i) for i in range(args.n_envs)])
+    # SubprocVecEnv crashes on Windows (ERROR_COMMITMENT_LIMIT shared mapping bug)
+    VecEnvCls = DummyVecEnv if platform.system() == "Windows" else SubprocVecEnv
+    vec_env = VecEnvCls([make_env(i) for i in range(args.n_envs)])
 
     policy_kwargs = dict(
         features_extractor_class=RobommeCNNExtractor,
