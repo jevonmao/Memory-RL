@@ -1,0 +1,59 @@
+# RoboMME benchmark — GPU training image (Linux only)
+#
+# Requires NVIDIA Container Toolkit on the host:
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# Build:
+#   docker build -f Dockerfile.train -t robomme-train .
+#
+# Run Baseline 1:
+#   docker run --gpus all --rm -v $(pwd)/runs:/workspace/runs robomme-train \
+#     python -m train.train_ppo --task BinFill --timesteps 1000000 --n_envs 4
+#
+# NOTE: This image will NOT work on Windows Docker Desktop because Windows
+# Docker uses a WSL2 Linux VM which lacks the NVIDIA Linux Vulkan ICD.
+# Use setup_windows.ps1 on native Windows instead.
+
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# ── System packages ────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv \
+    git curl ca-certificates \
+    libvulkan1 vulkan-tools \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libgomp1 \
+    # OpenCV runtime deps
+    libglib2.0-0 libsm6 libxrender1 libxext6 \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── NVIDIA Vulkan ICD (required for sapien GPU rendering) ──────────────────────
+# The cuda base image ships the driver but not the Vulkan ICD file.
+# We write one pointing at the driver's libGLX_nvidia.so.
+RUN mkdir -p /etc/vulkan/icd.d && \
+    printf '{\n  "file_format_version": "1.0.0",\n  "ICD": {\n    "library_path": "libGLX_nvidia.so.0",\n    "api_version": "1.3.0"\n  }\n}\n' \
+    > /etc/vulkan/icd.d/nvidia_icd.json
+
+# ── uv ─────────────────────────────────────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# ── Python project ─────────────────────────────────────────────────────────────
+WORKDIR /workspace
+COPY pyproject.toml uv.lock ./
+COPY src/ src/
+COPY train/ train/
+
+# Install all dependencies from the lockfile (no network needed after this layer)
+RUN uv sync --frozen
+
+# ── Default command ────────────────────────────────────────────────────────────
+# Override with: docker run ... robomme-train python -m train.train_ppo_icm ...
+CMD [".venv/bin/python", "-m", "train.train_ppo", \
+     "--task", "BinFill", \
+     "--timesteps", "1000000", \
+     "--n_envs", "4", \
+     "--outdir", "runs/ppo"]

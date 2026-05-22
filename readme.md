@@ -15,6 +15,27 @@
 
 ## 📦 Installation
 
+### Windows (native — required for Vulkan GPU rendering)
+
+> Docker on Windows does **not** work for this benchmark because Windows Docker runs in a WSL2 Linux VM which lacks the NVIDIA Linux Vulkan ICD needed by SAPIEN. Use native Windows with the setup script below.
+
+```powershell
+git clone https://github.com/RoboMME/robomme_benchmark.git
+cd robomme_benchmark
+
+# One-shot setup: installs uv, creates venv, applies patches, runs smoke test
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\setup_windows.ps1
+```
+
+The script handles everything: uv installation, CUDA PyTorch, the `mplib` stub (no Windows wheels), and the ManiSkill Vulkan PCI address patch. See [TRAINING_SETUP_WINDOWS.md](TRAINING_SETUP_WINDOWS.md) for the full manual walkthrough and troubleshooting.
+
+**Requirements:** Windows 10 21H2+, NVIDIA GPU (driver 527+), Python 3.11, Git.
+
+---
+
+### Linux / Cloud GPU servers
+
 (1) Using `uv`  
 After cloning the repo, install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
@@ -37,6 +58,13 @@ docker run --rm -it --gpus all \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video \
   -v "$PWD/runs:/app/runs" \
   robomme:cuda12.8
+```
+
+For GPU training specifically (uses `Dockerfile.train`):
+
+```bash
+docker build -f Dockerfile.train -t robomme-train .
+docker run --gpus all --rm -v $(pwd)/runs:/workspace/runs robomme-train
 ```
 
 More Docker options (mounting datasets, troubleshooting, etc.) are in [doc/docker_installation.md](doc/docker_installation.md).
