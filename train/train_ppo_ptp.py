@@ -107,9 +107,11 @@ def main():
     )
 
     ckpt_cb = CheckpointCallback(
-        save_freq=max(50_000 // args.n_envs, 1),
+        save_freq=max(100_000 // args.n_envs, 1),
         save_path=os.path.join(args.outdir, "ckpts"),
         name_prefix=f"ppo_ptp_{args.task}",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
     )
 
     model.learn(
