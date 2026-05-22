@@ -1,0 +1,56 @@
+# IQL (Implicit Q-Learning) offline training configuration.
+# Reference: Kostrikov et al. 2021 — https://arxiv.org/abs/2110.06169
+#
+# Training needs no live environment — reads directly from H5 files.
+# On Modal: modal run modal_app/app.py::train_iql --task PickXtimes --seed 0
+
+task_name: PickXtimes
+seed: 0
+output_dir: logs
+
+# ---- Dataset ----------------------------------------------------------------
+# H5 format (confirmed via inspect_h5 on record_dataset_PickXtimes.h5):
+#   FLAT layout — all timestep_K groups sit at the file root.
+#   Each timestep_K/ has: obs/, action/, info/
+#
+#   obs/
+#     eef_state:     (6,)  float32  — end-effector pos (3) + rpy (3)
+#     joint_state:   (7,)  float32  — joint positions
+#     gripper_state: (2,)  float32  — gripper open/close state
+#     (also available but unused: front_rgb, wrist_rgb, depth, camera_extrinsics)
+#
+#   action/
+#     joint_action:    (8,)  float64  ← used (7 joints + gripper)
+#     eef_action:      (7,)  float64
+#     waypoint_action: (7,)  float64
+#
+#   info/
+#     is_completed: () bool  — reward signal (1.0 on success, else 0.0)
+#
+# Resulting obs_dim = 6 + 7 + 2 = 15
+# Resulting action_dim = 8
+
+obs_keys:
+  - eef_state       # (6,)  end-effector position + rpy orientation
+  - joint_state     # (7,)  joint positions
+  - gripper_state   # (2,)  gripper state
+action_key: joint_action    # (8,) inside action/ sub-group
+max_transitions: null       # null = load all; set int to cap (e.g. 500000)
+reward_scale: 1.0           # rewards are binary (0/1); no scaling needed
+
+# ---- Training loop ----------------------------------------------------------
+total_steps: 500000
+batch_size: 256
+num_workers: 4
+log_interval: 1000
+save_interval: 50000
+
+# ---- IQL hyperparameters (defaults from the paper) -------------------------
+# obs_dim=15, action_dim=8 (set automatically from data; shown here for reference)
+hidden: 256
+learning_rate: 3.0e-4
+gamma: 0.99
+tau: 0.005          # target-network EMA rate (polyak)
+expectile: 0.7      # τ in expectile regression; >0.5 = pessimistic
+temperature: 3.0    # β in AWR: sharpness of advantage weighting
+advantage_clip: 100.0

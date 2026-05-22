@@ -2,30 +2,48 @@
 
 Why this exists
 ---------------
-SAPIEN/ManiSkill require a Vulkan ICD that WSL2 doesn't expose. Modal's
-containers run on real Linux with proper NVIDIA Vulkan drivers, so we ship
-training there. RoboMME source is cloned into the image at build time;
-datasets and run outputs are persisted on a Modal Volume — no local
-directories beyond this repo are required.
+SAPIEN/ManiSkill require a Vulkan ICD that WSL2 doesn't expose and Modal
+does not support SAPIEN/Vulkan. Offline IQL training reads directly from H5
+demonstration files — no environment stepping, no Vulkan dependency — and
+runs fully on Modal. RoboMME source is cloned into the image at build time;
+datasets and run outputs are persisted on a Modal Volume.
 
-Workflow
---------
-    # One-time: download RoboMME episode datasets onto the Modal volume.
+Offline IQL workflow (primary — no SAPIEN needed)
+-------------------------------------------------
+    # 1. One-time: download H5 episode datasets onto the Modal volume.
     modal run modal_app/app.py::download_data
+    modal run modal_app/app.py::download_data --tasks BinFill,PickXtimes,StopCube,VideoUnmask
 
-    # Verify RoboMME imports and the env steps correctly on Modal.
+    # 2. One-time: verify H5 structure matches expected obs/action keys.
+    #    Check printed key names; update obs_keys in configs/iql.yaml if needed.
+    modal run modal_app/app.py::inspect_h5 --task BinFill
+
+    # 3. Train IQL offline on a single task/seed.
+    modal run modal_app/app.py::train_iql --task BinFill --seed 0
+    modal run modal_app/app.py::train_iql --task BinFill --seed 0 --steps 1000000
+
+    # 4. Train 4 tasks x 3 seeds in parallel.
+    modal run modal_app/app.py::iql_sweep
+    modal run modal_app/app.py::iql_sweep --steps 1000000
+
+Online PPO workflow (blocked — requires SAPIEN/Vulkan)
+------------------------------------------------------
+    # These commands require a machine with full SAPIEN/Vulkan support.
+    # They are kept here for reference but will not run on Modal.
+
+    # Verify RoboMME env steps correctly (needs Vulkan).
     modal run modal_app/app.py::smoke --task BinFill
 
-    # Single PPO training run (outputs saved to volume).
+    # Single PPO training run.
     modal run modal_app/app.py::train_ppo --task BinFill --seed 0 --steps 100000
 
-    # Evaluate the saved checkpoint from a training run.
+    # Evaluate a PPO checkpoint.
     modal run modal_app/app.py::evaluate --task BinFill --seed 0
 
-    # Random-policy sanity check (no training required).
+    # Random-policy sanity check.
     modal run modal_app/app.py::random_baseline --task BinFill --episodes 20
 
-    # Full baseline sweep: 4 tasks x 3 seeds in parallel.
+    # Full PPO sweep: 4 tasks x 3 seeds in parallel.
     modal run modal_app/app.py::sweep
 """
 from __future__ import annotations
@@ -422,6 +440,122 @@ def random_baseline(task: str = "BinFill", episodes: int = 20, seed: int = 0) ->
             infos.append(info)
         records.append(EpisodeRecord(observations, rewards, term, trunc, infos))
     return summarize(records)
+
+
+# ---------------------------------------------------------------------------
+# inspect_h5 — print H5 file structure so we can verify obs/action keys
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=None,
+    timeout=900,
+    volumes={VOLUME_PATH: volume},
+)
+def inspect_h5(task: str = "PickXtimes", n_timesteps: int = 3) -> dict:
+    """Print a safe summary of the H5 structure without walking all timestep groups.
+
+    Shows top-level key counts, root obs/info structure, and the first
+    n_timesteps timestep groups. Safe on large files (no full tree walk).
+
+    Example:
+        modal run modal_app/app.py::inspect_h5 --task PickXtimes
+    """
+    _setup()
+    volume.reload()
+
+    from data.h5_dataset import find_h5_files, inspect_h5 as _inspect  # type: ignore
+
+    paths = find_h5_files(DATA_DIR, task)
+    if not paths:
+        raise FileNotFoundError(
+            f"No H5 files for task '{task}' in {DATA_DIR}. Run download_data first."
+        )
+
+    for path in paths[:1]:
+        _inspect(path, n_timesteps=n_timesteps)
+
+    return {"task": task, "files": [str(p) for p in paths]}
+
+
+# ---------------------------------------------------------------------------
+# train_iql — offline IQL from H5 data (no SAPIEN / Vulkan needed)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=6 * 60 * 60,
+    secrets=[WANDB_SECRET],
+    volumes={VOLUME_PATH: volume},
+)
+def train_iql(
+    task: str = "BinFill",
+    seed: int = 0,
+    steps: int = 500_000,
+    tag: str | None = None,
+) -> dict:
+    """Train an IQL agent offline from H5 demonstrations — no SAPIEN/Vulkan needed.
+
+    H5 data must already be on the volume (run download_data first).
+    Checkpoints are written to the volume under logs/<run_name>/checkpoints/.
+
+    Example:
+        modal run modal_app/app.py::train_iql --task BinFill --seed 0
+        modal run modal_app/app.py::train_iql --task BinFill --seed 0 --steps 1000000
+
+    Returns the run directory name (useful for scripted pipelines).
+    """
+    _setup()
+    volume.reload()
+
+    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+    import wandb  # noqa: F401 — wire WANDB_API_KEY before training imports
+
+    from training.train_iql import main as iql_main  # type: ignore
+
+    sys.argv = [
+        "train_iql",
+        "--config",      "/workspace/configs/iql.yaml",
+        "--task",        task,
+        "--seed",        str(seed),
+        "--total_steps", str(steps),
+        "--output_dir",  LOGS_DIR,
+        "--data_dir",    DATA_DIR,
+    ]
+    if tag:
+        sys.argv += ["--tag", tag]
+
+    iql_main()
+    volume.commit()
+
+    run_dirs = sorted(
+        Path(LOGS_DIR).glob(f"{task}_seed{seed}_*"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    run_name = run_dirs[-1].name if run_dirs else None
+    return {"task": task, "seed": seed, "run_name": run_name, "logs_dir": LOGS_DIR}
+
+
+# ---------------------------------------------------------------------------
+# iql_sweep — 4 tasks x 3 seeds offline IQL in parallel
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def iql_sweep(steps: int = 500_000):
+    """Train IQL on 4 tasks x 3 seeds in parallel (no SAPIEN needed)."""
+    tasks = ["BinFill", "PickXtimes", "StopCube", "VideoUnmask"]
+    seeds = [0, 1, 2]
+    jobs  = [(t, s) for t in tasks for s in seeds]
+
+    print(f"[iql_sweep] launching {len(jobs)} IQL runs on Modal ({GPU}) ...")
+    results = list(
+        train_iql.starmap([(t, s, steps, "iql-baseline") for t, s in jobs])
+    )
+    print("\n[iql_sweep] all runs complete:")
+    for r in results:
+        print(f"  {r['task']:20s} seed={r['seed']}  run={r['run_name']}")
 
 
 # ---------------------------------------------------------------------------
