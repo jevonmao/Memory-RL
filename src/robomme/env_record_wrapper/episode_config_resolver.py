@@ -190,11 +190,38 @@ class BenchmarkEnvBuilder:
         )
 
         seed, difficulty_hint = self.resolve_episode(episode_idx)
+        import os, platform, torch
+        _sim_backend = os.environ.get("ROBOMME_SIM_BACKEND")
+        _render_backend = os.environ.get("ROBOMME_RENDER_BACKEND")
+        if _sim_backend is None or _render_backend is None:
+            if platform.system() == "Windows":
+                def _win_vulkan():
+                    try:
+                        import subprocess
+                        r = subprocess.run(
+                            ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        pci = r.stdout.strip().lower()
+                        if pci:
+                            parts = pci.split(":")
+                            return f"pci:{parts[1]}:{parts[2]}"
+                    except Exception:
+                        pass
+                    return "cpu"
+                _sim_backend = _sim_backend or "physx_cpu"
+                _render_backend = _render_backend or _win_vulkan()
+            else:
+                _gpu = torch.cuda.is_available()
+                _sim_backend = _sim_backend or ("physx_cuda" if _gpu else "physx_cpu")
+                _render_backend = _render_backend or ("gpu" if _gpu else "cpu")
         env_kwargs = dict(
             obs_mode="rgb+depth+segmentation",
             control_mode="pd_joint_pos",
             render_mode=self.render_mode,
             reward_mode="dense",
+            sim_backend=_sim_backend,
+            render_backend=_render_backend,
         )
         if seed is not None:
             env_kwargs["seed"] = seed
