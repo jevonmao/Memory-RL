@@ -219,7 +219,13 @@ class BenchmarkEnvBuilder:
             obs_mode="rgb+depth+segmentation",
             control_mode="pd_joint_pos",
             render_mode=self.render_mode,
-            reward_mode="dense",
+            # Default to "sparse" because every task's compute_dense_reward is a
+            # zero stub (the benchmark grades via success/fail flags). Sparse mode
+            # returns info["success"] - info["fail"] from BaseEnv.compute_sparse_reward,
+            # which is well-defined. RL training paths that need a shaped reward
+            # build it in the wrapper layer (see train/rewards/).
+            # The two test fixtures that need the dense path override this explicitly.
+            reward_mode="sparse",
             sim_backend=_sim_backend,
             render_backend=_render_backend,
         )

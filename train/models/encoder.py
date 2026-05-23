@@ -118,8 +118,11 @@ class RobommeMemoryExtractor(BaseFeaturesExtractor):
         from train.models.ptp_memory import MemoryTransformer
         K          = observation_space["history_state"].shape[0]
         state_dim  = observation_space["history_state"].shape[1]   # STATE_DIM = 15
-        action_dim = observation_space["history_action"].shape[1]  # ACTION_DIM = 8
-        token_dim  = state_dim + action_dim                        # 23
+        # PTP plan decision #4: input tokens are state-only so the past-action
+        # prediction task isn't trivial (action would otherwise appear in the
+        # input and be copyable). PTPHead still predicts past + future actions
+        # from the CLS embedding; only the encoder's *input* changes.
+        token_dim  = state_dim                                     # 15
 
         self.front_enc  = _ResNetTrunk(img_feat_dim)
         self.wrist_enc  = _ResNetTrunk(img_feat_dim)
@@ -143,10 +146,8 @@ class RobommeMemoryExtractor(BaseFeaturesExtractor):
         # current state (last entry of history, always valid)
         state = obs["history_state"][:, -1, :]   # (B, STATE_DIM)
 
-        tokens = torch.cat([
-            obs["history_state"],
-            obs["history_action"],
-        ], dim=-1)   # (B, K, token_dim)
+        # State-only tokens (see __init__ comment for the why).
+        tokens = obs["history_state"]            # (B, K, STATE_DIM)
 
         return torch.cat([
             self.front_enc(front),

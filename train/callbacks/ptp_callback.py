@@ -80,23 +80,33 @@ class PTPCallback(BaseCallback):
         hist_a  = hist_a.view(T * E, self.K, self.action_dim)
         acts_t  = acts_t.view(T * E, self.action_dim)     # (T*E, action_dim)
 
-        # Compute PTP targets: next action is acts_t, history actions are hist_a
-        # Build token sequence: (state ‖ action) per step
-        tokens = torch.cat([hist_s, hist_a], dim=-1)       # (T*E, K, token_dim)
+        # Plan decision #4: input tokens are STATE ONLY. Predicting past
+        # actions from a sequence that contains those very actions is trivial
+        # identity — the previous (state ‖ action) input made the past loss
+        # collapse to a near-zero copy. State-only forces the model to learn
+        # an inverse-dynamics representation over the history.
+        tokens = hist_s                                    # (T*E, K, STATE_DIM)
 
         self._opt.zero_grad()
         memory_feat = self.memory_transformer(tokens)      # (T*E, memory_dim)
         past_pred, future_pred = self.ptp_head(memory_feat)
 
-        # Build mask: zero-padded entries in history_action have norm ≈ 0
-        mask = (hist_a.abs().sum(-1) > 1e-6).float()      # (T*E, K)
+        # Mask off zero-padded history positions (state padding has norm ≈ 0).
+        mask = (hist_s.abs().sum(-1) > 1e-6).float()      # (T*E, K)
 
         loss = ptp_loss(past_pred, future_pred, hist_a, acts_t, mask=mask)
         (self.ptp_weight * loss).backward()
         self._opt.step()
 
         if self.verbose >= 1:
-            self.logger.record("ptp/loss", loss.item())
+            # Log overall + the two halves so we can spot a remaining input leak
+            # (a past_loss collapsing to <1e-4 would signal trouble).
+            with torch.no_grad():
+                past_l   = torch.nn.functional.mse_loss(past_pred,   hist_a).item()
+                future_l = torch.nn.functional.mse_loss(future_pred, acts_t).item()
+            self.logger.record("ptp/loss",        loss.item())
+            self.logger.record("ptp/past_loss",   past_l)
+            self.logger.record("ptp/future_loss", future_l)
 
     def _on_step(self) -> bool:
         return True

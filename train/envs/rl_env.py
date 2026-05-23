@@ -3,20 +3,27 @@ gym.Env wrapper around BenchmarkEnvBuilder for RL training.
 
 Baseline 1 & 2 use RobommeRLEnv (current obs only).
 Baseline 3 uses RobommeRLEnvWithMemory (current obs + K-step state/action history).
+
+The benchmark's underlying compute_dense_reward is a zero stub, so this wrapper
+substitutes a shaped reward from train.rewards.<task>.<TaskReward> when one is
+registered. See plan: F1-F3, train/rewards/binfill.py.
 """
 
 from __future__ import annotations
 
+import gc
 import platform
 import subprocess
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 
 import gymnasium as gym
 import numpy as np
+import torch
 from gymnasium import spaces
 
 from robomme.env_record_wrapper import BenchmarkEnvBuilder
+from train.rewards import make_reward
 
 
 def _vulkan_render_backend() -> str:
@@ -39,6 +46,16 @@ _RENDER_BACKEND = _vulkan_render_backend()
 IMG_H, IMG_W = 128, 128   # resize obs images to save memory
 STATE_DIM = 15             # joint(7) + eef(6) + gripper(2)
 ACTION_DIM = 8
+
+
+def _to_scalar(x: Any) -> Any:
+    """Coerce torch / numpy / batched scalars down to a Python scalar."""
+    if hasattr(x, "cpu"):
+        x = x.cpu().numpy()
+    arr = np.asarray(x)
+    if arr.size == 1:
+        return arr.item()
+    return arr.flat[0]
 
 
 def _extract_obs(raw_obs: dict) -> dict[str, np.ndarray]:
@@ -68,12 +85,19 @@ def _extract_obs(raw_obs: dict) -> dict[str, np.ndarray]:
 class RobommeRLEnv(gym.Env):
     """
     Standard (memoryless) gym wrapper for RL.
-    Cycles through train-split episodes of a single task.
+
+    Cycles through train-split episodes of a single task in a shuffled order
+    that reshuffles every pass. The shaped reward (if registered for this
+    task) replaces the underlying env's reward; otherwise the env reward is
+    passed through unchanged.
     """
 
     metadata = {"render_modes": ["rgb_array"]}
 
-    def __init__(self, env_id: str = "BinFill", seed: int = 0):
+    def __init__(self,
+                 env_id: str = "BinFill",
+                 seed: int = 0,
+                 shape_reward: bool = True):
         super().__init__()
         self.env_id = env_id
         self._rng = np.random.default_rng(seed)
@@ -84,8 +108,18 @@ class RobommeRLEnv(gym.Env):
             max_steps=500,
         )
         self._num_episodes = self._builder.get_episode_num()
-        self._episode_idx = 0
+        if self._num_episodes <= 0:
+            raise RuntimeError(
+                f"BenchmarkEnvBuilder reports 0 episodes for {env_id} "
+                f"(train split); cannot train."
+            )
+        # Shuffled episode pointer (reshuffled every pass).
+        self._episode_order = self._rng.permutation(self._num_episodes)
+        self._pos = 0
         self._env = None
+
+        # Per-task shaped reward (None if not registered → pass through env reward).
+        self._reward_fn = make_reward(env_id) if shape_reward else None
 
         self.observation_space = spaces.Dict({
             "front_rgb":   spaces.Box(0, 255, (IMG_H, IMG_W, 3), dtype=np.uint8),
@@ -97,30 +131,66 @@ class RobommeRLEnv(gym.Env):
         self.action_space = spaces.Box(-1., 1., (ACTION_DIM,), dtype=np.float32)
 
     # ------------------------------------------------------------------
-    def reset(self, *, seed=None, options=None):
-        if self._env is not None:
-            self._env.close()
+    def _next_episode_idx(self) -> int:
+        if self._pos >= len(self._episode_order):
+            self._episode_order = self._rng.permutation(self._num_episodes)
+            self._pos = 0
+        ep = int(self._episode_order[self._pos])
+        self._pos += 1
+        return ep
 
-        ep = self._episode_idx % self._num_episodes
-        self._episode_idx += 1
+    def _release_env(self) -> None:
+        """Tear down the current inner env without calling its .close().
+
+        ManiSkill's close() path appears to leak VRAM when paired with
+        gym.make() of a fresh env; dropping the reference and forcing GC
+        keeps VRAM flat across many resets.
+        """
+        if self._env is not None:
+            self._env = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def reset(self, *, seed=None, options=None):
+        # Reseed the episode-order RNG if SB3 passes one through.
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+            self._episode_order = self._rng.permutation(self._num_episodes)
+            self._pos = 0
+
+        self._release_env()
+
+        ep = self._next_episode_idx()
         self._env = self._builder.make_env_for_episode(ep)
-        raw_obs, info = self._env.reset()
-        return _extract_obs(raw_obs), {}
+        # Per-reset inner-env seed: derived from our RNG so different --seed
+        # values produce different trajectories (the resolver's metadata seed
+        # is fixed per episode_idx).
+        inner_seed = int(self._rng.integers(0, 2**31 - 1))
+        raw_obs, info = self._env.reset(seed=inner_seed)
+
+        if self._reward_fn is not None:
+            self._reward_fn.reset(self._env.unwrapped)
+
+        return _extract_obs(raw_obs), info if isinstance(info, dict) else {}
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -1., 1.).astype(np.float32)
         raw_obs, reward, terminated, truncated, info = self._env.step(action)
 
-        obs = _extract_obs(raw_obs)
-        rew = float(reward.cpu().item() if hasattr(reward, "cpu") else reward)
-        term = bool(terminated.cpu().item() if hasattr(terminated, "cpu") else terminated)
-        trunc = bool(truncated.cpu().item() if hasattr(truncated, "cpu") else truncated)
+        obs   = _extract_obs(raw_obs)
+        term  = bool(_to_scalar(terminated))
+        trunc = bool(_to_scalar(truncated))
+
+        if self._reward_fn is not None:
+            rew = self._reward_fn.step(self._env.unwrapped, info if isinstance(info, dict) else {})
+        else:
+            rew = float(_to_scalar(reward))
+
         return obs, rew, term, trunc, info
 
     def close(self):
-        if self._env is not None:
-            self._env.close()
-            self._env = None
+        self._release_env()
 
     def render(self):
         pass
@@ -134,12 +204,15 @@ class RobommeRLEnvWithMemory(RobommeRLEnv):
       history_state  : (K, STATE_DIM)  — last K [joint‖eef‖gripper] vectors
       history_action : (K, ACTION_DIM) — last K actions taken
 
-    Both are zero-padded at episode start.
-    Memory resets at every episode boundary.
+    Both are zero-padded at episode start. Memory resets at every episode boundary.
     """
 
-    def __init__(self, env_id: str = "BinFill", seed: int = 0, K: int = 8):
-        super().__init__(env_id=env_id, seed=seed)
+    def __init__(self,
+                 env_id: str = "BinFill",
+                 seed: int = 0,
+                 K: int = 8,
+                 shape_reward: bool = True):
+        super().__init__(env_id=env_id, seed=seed, shape_reward=shape_reward)
         self.K = K
         self._state_buf:  deque[np.ndarray] = deque(maxlen=K)
         self._action_buf: deque[np.ndarray] = deque(maxlen=K)
