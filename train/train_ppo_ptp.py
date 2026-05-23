@@ -46,7 +46,7 @@ def parse_args():
     p.add_argument("--n_steps",     type=int,   default=2048)
     p.add_argument("--batch_size",  type=int,   default=256)
     p.add_argument("--n_epochs",    type=int,   default=4)
-    p.add_argument("--target_kl",   type=float, default=0.02)
+    p.add_argument("--target_kl",   type=float, default=0.05)
     p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--ptp_lr",      type=float, default=3e-4)
     p.add_argument("--ptp_weight",  type=float, default=0.1,

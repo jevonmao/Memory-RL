@@ -3,6 +3,11 @@
 Reward shape:
   - step penalty            : -0.01     (encourages finishing)
   - in-bin progress         : +1.0      per newly-binned target-color cube
+  - per-step proximity      : +0.05 / (1 + cur_dist)
+                              (provides a non-zero per-step gradient — fixes
+                               the v3 issue where potential-based reach alone
+                               telescopes to ~0 over an episode and the agent
+                               sees only the -0.01 floor)
   - potential-based reach   : +0.5 * (prev_dist - cur_dist), dist = TCP→nearest needed cube
                               (switches to TCP→button once all target cubes are placed)
   - terminal                : +10.0 on info["success"], -5.0 on info["fail"]
@@ -37,6 +42,7 @@ class BinFillReward:
     STEP_PENALTY     = -0.01
     BIN_PROGRESS     =  1.0
     REACH_COEF       =  0.5
+    PROXIMITY_COEF   =  0.05   # per-step bonus = COEF / (1 + dist)
     TERMINAL_SUCCESS = 10.0
     TERMINAL_FAIL    = -5.0
 
@@ -59,10 +65,16 @@ class BinFillReward:
         r += self.BIN_PROGRESS * delta
         self._prev_in_bin = cur
 
-        # Potential-based reaching reward.
+        # Reaching: combine a per-step proximity bonus (climbing signal at
+        # every step) with potential-based shaping (incentive for sustained
+        # net motion). The proximity term is the one PPO actually learns from
+        # in early training; potential-based shaping kicks in once the policy
+        # is competent enough to make multi-step net progress.
         cur_dist = self._min_target_dist(unwrapped)
-        if cur_dist is not None and self._prev_dist is not None:
-            r += self.REACH_COEF * (self._prev_dist - cur_dist)
+        if cur_dist is not None:
+            r += self.PROXIMITY_COEF / (1.0 + cur_dist)
+            if self._prev_dist is not None:
+                r += self.REACH_COEF * (self._prev_dist - cur_dist)
         self._prev_dist = cur_dist
 
         # Terminal bonuses (info flags come from BinFill.evaluate()).
