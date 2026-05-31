@@ -506,10 +506,20 @@ def train_iql(
 
     Returns the run directory name (useful for scripted pipelines).
     """
+    import signal
+
     _setup()
     volume.reload()
 
     Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Commit the volume on SIGTERM (Modal cancellation) so any checkpoints
+    # already written to /vol are persisted before the container exits.
+    def _sigterm_handler(_signum, _frame):
+        print("[train_iql] SIGTERM received — committing volume before exit")
+        volume.commit()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     import wandb  # noqa: F401 — wire WANDB_API_KEY before training imports
 
@@ -527,8 +537,14 @@ def train_iql(
     if tag:
         sys.argv += ["--tag", tag]
 
-    iql_main()
-    volume.commit()
+    def _on_checkpoint(step, path):
+        print(f"[train_iql] committing checkpoint step={step} → volume")
+        volume.commit()
+
+    try:
+        iql_main(on_checkpoint=_on_checkpoint)
+    finally:
+        volume.commit()
 
     run_dirs = sorted(
         Path(LOGS_DIR).glob(f"{task}_seed{seed}_*"),
@@ -536,6 +552,133 @@ def train_iql(
     )
     run_name = run_dirs[-1].name if run_dirs else None
     return {"task": task, "seed": seed, "run_name": run_name, "logs_dir": LOGS_DIR}
+
+
+# ---------------------------------------------------------------------------
+# eval_iql_offline — offline IQL evaluation from H5 dataset (no SAPIEN needed)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=60 * 60,
+    volumes={VOLUME_PATH: volume},
+)
+def eval_iql_offline(
+    task: str = "PickXtimes",
+    seed: int = 0,
+    checkpoint: str | None = None,
+    val_fraction: float = 0.2,
+) -> dict:
+    """Evaluate a trained IQL checkpoint against the offline H5 dataset.
+
+    No SAPIEN / Vulkan required — runs fully offline on Modal.
+
+    Checkpoint resolution order:
+      1. Explicit --checkpoint path (e.g. /workspace/iql_final.pt for the
+         repo-root file uploaded from your local machine, or an absolute path
+         inside the volume).
+      2. Most recently modified iql_final.pt for (task, seed) in the volume
+         logs directory (i.e. the output of a prior train_iql run).
+
+    Examples:
+        modal run modal_app/app.py::eval_iql_offline --task PickXtimes
+        modal run modal_app/app.py::eval_iql_offline --task PickXtimes --seed 0 \\
+            --checkpoint /workspace/iql_final.pt
+
+    Returns the metrics dict (action_mse, action_rmse, v_mean, q_mean,
+    adv_mean, adv_positive_fraction, dataset_success_rate, num_transitions).
+    """
+    import json
+
+    _setup()
+    volume.reload()
+
+    if checkpoint is None:
+        candidates = sorted(
+            Path(LOGS_DIR).glob(f"{task}_seed{seed}_*/checkpoints/iql_final.pt"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not candidates:
+            raise FileNotFoundError(
+                f"No iql_final.pt found for task={task} seed={seed} in {LOGS_DIR}. "
+                "Pass --checkpoint explicitly or run train_iql first."
+            )
+        ckpt_path = str(candidates[-1])
+    else:
+        ckpt_path = checkpoint
+
+    print(f"[eval_iql_offline] checkpoint: {ckpt_path}")
+
+    out_dir = f"{LOGS_DIR}/eval_offline_{task}_seed{seed}"
+
+    from training.eval_iql_offline import main as offline_eval_main  # type: ignore
+
+    sys.argv = [
+        "eval_iql_offline",
+        "--checkpoint",   ckpt_path,
+        "--task",         task,
+        "--seed",         str(seed),
+        "--data_dir",     DATA_DIR,
+        "--val_fraction", str(val_fraction),
+        "--out_dir",      out_dir,
+    ]
+    offline_eval_main()
+    volume.commit()
+
+    metrics_path = Path(out_dir) / "metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path) as f:
+            return json.load(f)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# train_eval_iql — train IQL then evaluate on the held-out val split
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def train_eval_iql(
+    task: str = "PickXtimes",
+    seed: int = 0,
+    steps: int = 500_000,
+    val_fraction: float = 0.2,
+    tag: str | None = None,
+):
+    """Train IQL offline, then evaluate on the held-out val split.
+
+    Episodes are split deterministically: the last val_fraction of sorted
+    episode keys are withheld from training and used exclusively for eval.
+    Both steps use the same val_fraction so the split is consistent.
+
+    Example:
+        modal run modal_app/app.py::train_eval_iql --task PickXtimes --seed 0
+        modal run modal_app/app.py::train_eval_iql --task PickXtimes --seed 0 \\
+            --steps 1000000 --val-fraction 0.2
+    """
+    import json
+
+    print(f"[train_eval_iql] task={task}  seed={seed}  steps={steps}  "
+          f"val_fraction={val_fraction}")
+
+    print("[train_eval_iql] === phase 1: training ===")
+    train_result = train_iql.remote(task=task, seed=seed, steps=steps, tag=tag)
+    run_name = train_result.get("run_name")
+    print(f"[train_eval_iql] training complete — run={run_name}")
+
+    # Use the exact checkpoint from this run to avoid ambiguity.
+    ckpt = f"{LOGS_DIR}/{run_name}/checkpoints/iql_final.pt" if run_name else None
+
+    print("[train_eval_iql] === phase 2: offline eval (val split) ===")
+    metrics = eval_iql_offline.remote(
+        task=task,
+        seed=seed,
+        checkpoint=ckpt,
+        val_fraction=val_fraction,
+    )
+
+    print("\n[train_eval_iql] === results ===")
+    print(json.dumps(metrics, indent=2))
 
 
 # ---------------------------------------------------------------------------

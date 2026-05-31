@@ -12,12 +12,21 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
+
+
+def infer_dims_from_checkpoint(ckpt_path: str | Path) -> tuple[int, int]:
+    """Return (obs_dim, action_dim) by inspecting saved weight tensor shapes."""
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    obs_dim    = ckpt["value"]["net.0.weight"].shape[1]
+    action_dim = ckpt["actor"]["mu.weight"].shape[0]
+    return obs_dim, action_dim
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -113,14 +122,29 @@ class IQL:
         tau: float = 0.005,
         expectile: float = 0.7,
         temperature: float = 3.0,
-        advantage_clip: float = 100.0,
+        adv_clip: float = 100.0,
+        weight_clip: float = 100.0,
+        max_grad_norm: float = 1.0,
+        action_mean: Optional[np.ndarray] = None,
+        action_std: Optional[np.ndarray] = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.gamma = gamma
         self.tau = tau
         self.expectile = expectile
         self.temperature = temperature
-        self.adv_clip = advantage_clip
+        self.adv_clip = adv_clip
+        self.weight_clip = weight_clip
+        self.max_grad_norm = max_grad_norm
+
+        if action_mean is not None and action_std is not None:
+            self.action_mean: Optional[torch.Tensor] = torch.tensor(
+                action_mean, dtype=torch.float32)
+            self.action_std:  Optional[torch.Tensor] = torch.tensor(
+                action_std,  dtype=torch.float32)
+        else:
+            self.action_mean = None
+            self.action_std  = None
 
         self.value  = ValueNet(obs_dim, hidden).to(self.device)
         self.qnet   = TwinQ(obs_dim, action_dim, hidden).to(self.device)
@@ -155,6 +179,7 @@ class IQL:
 
         self.v_opt.zero_grad()
         v_loss.backward()
+        nn.utils.clip_grad_norm_(self.value.parameters(), self.max_grad_norm)
         self.v_opt.step()
 
         # ---- Q update: Bellman backup with V(s') ----
@@ -167,6 +192,7 @@ class IQL:
 
         self.q_opt.zero_grad()
         q_loss.backward()
+        nn.utils.clip_grad_norm_(self.qnet.parameters(), self.max_grad_norm)
         self.q_opt.step()
         self._soft_update()
 
@@ -174,13 +200,15 @@ class IQL:
         with torch.no_grad():
             adv = (self.q_tgt.min(obs, actions) - self.value(obs))
             adv = adv.clamp(-self.adv_clip, self.adv_clip)
-            weights = (self.temperature * adv).exp().clamp(max=self.adv_clip)
+            weights = (self.temperature * adv).exp().clamp(max=self.weight_clip)
+            weights = weights / (weights.mean() + 1e-8)
 
         log_pi   = self.actor.log_prob(obs, actions)
         actor_loss = -(weights * log_pi).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_opt.step()
 
         return {
@@ -194,12 +222,16 @@ class IQL:
 
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
-        torch.save({
+        ckpt: dict = {
             "value":  self.value.state_dict(),
             "qnet":   self.qnet.state_dict(),
             "q_tgt":  self.q_tgt.state_dict(),
             "actor":  self.actor.state_dict(),
-        }, path)
+        }
+        if self.action_mean is not None:
+            ckpt["action_mean"] = self.action_mean
+            ckpt["action_std"]  = self.action_std
+        torch.save(ckpt, path)
 
     def load(self, path: str | Path) -> None:
         ckpt = torch.load(path, map_location=self.device)
@@ -207,10 +239,16 @@ class IQL:
         self.qnet.load_state_dict(ckpt["qnet"])
         self.q_tgt.load_state_dict(ckpt["q_tgt"])
         self.actor.load_state_dict(ckpt["actor"])
+        if "action_mean" in ckpt:
+            self.action_mean = ckpt["action_mean"].to("cpu")
+            self.action_std  = ckpt["action_std"].to("cpu")
 
     # ------------------------------------------------------------------
     def predict(self, obs: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """Return an action tensor given a batched obs tensor (on CPU)."""
+        """Return a denormalized action tensor given a batched obs tensor (on CPU)."""
         obs = obs.to(self.device)
         with torch.no_grad():
-            return (self.actor.mode(obs) if deterministic else self.actor.sample(obs)).cpu()
+            action = (self.actor.mode(obs) if deterministic else self.actor.sample(obs)).cpu()
+            if self.action_mean is not None and self.action_std is not None:
+                action = action * self.action_std + self.action_mean
+            return action

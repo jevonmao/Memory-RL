@@ -41,9 +41,9 @@ reward_scale: 1.0           # rewards are binary (0/1); no scaling needed
 # ---- Training loop ----------------------------------------------------------
 total_steps: 500000
 batch_size: 256
-num_workers: 4
+num_workers: 0
 log_interval: 1000
-save_interval: 50000
+save_interval: 10000
 
 # ---- IQL hyperparameters (defaults from the paper) -------------------------
 # obs_dim=15, action_dim=8 (set automatically from data; shown here for reference)
@@ -53,4 +53,6 @@ gamma: 0.99
 tau: 0.005          # target-network EMA rate (polyak)
 expectile: 0.7      # τ in expectile regression; >0.5 = pessimistic
 temperature: 3.0    # β in AWR: sharpness of advantage weighting
-advantage_clip: 100.0
+adv_clip: 100.0     # clamp range for raw advantages before exponentiation
+weight_clip: 100.0  # cap on AWR importance weights exp(β·A)
+max_grad_norm: 1.0  # gradient clipping for all three optimizers

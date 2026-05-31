@@ -39,12 +39,20 @@ def parse_args():
     ap.add_argument("--seed",        type=int,         default=None)
     ap.add_argument("--total_steps", type=int,         default=None)
     ap.add_argument("--output_dir",  default=None)
-    ap.add_argument("--data_dir",    default=None, help="Path to directory containing H5 files")
-    ap.add_argument("--tag",         default=None)
+    ap.add_argument("--data_dir",     default=None, help="Path to directory containing H5 files")
+    ap.add_argument("--val_fraction", type=float,   default=None,
+                    help="Fraction of episodes held out for val (default: 0.2)")
+    ap.add_argument("--tag",          default=None)
     return ap.parse_args()
 
 
-def main() -> int:
+def main(on_checkpoint=None) -> int:
+    """Run offline IQL training.
+
+    on_checkpoint: optional callable(step, path) called after each checkpoint
+    is written — used by the Modal entrypoint to commit the volume so files
+    survive cancellation.
+    """
     args = parse_args()
     cfg  = load_yaml(args.config)
     overrides = {k: v for k, v in vars(args).items()
@@ -78,7 +86,11 @@ def main() -> int:
         num_workers=cfg.get("num_workers", 4),
         max_transitions=cfg.get("max_transitions"),
         reward_scale=cfg.get("reward_scale", 1.0),
+        split="train",
+        val_fraction=cfg.get("val_fraction", 0.2),
     )
+    action_mean = loader.dataset.action_mean
+    action_std  = loader.dataset.action_std
 
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,7 +106,11 @@ def main() -> int:
         tau=cfg.get("tau", 0.005),
         expectile=cfg.get("expectile", 0.7),
         temperature=cfg.get("temperature", 3.0),
-        advantage_clip=cfg.get("advantage_clip", 100.0),
+        adv_clip=cfg.get("adv_clip", cfg.get("advantage_clip", 100.0)),
+        weight_clip=cfg.get("weight_clip", 100.0),
+        max_grad_norm=cfg.get("max_grad_norm", 1.0),
+        action_mean=action_mean,
+        action_std=action_std,
     )
 
     # TensorBoard
@@ -162,10 +178,14 @@ def main() -> int:
             if tb:
                 tb.flush()
             print(f"[train_iql] saved {ckpt_path}")
+            if on_checkpoint:
+                on_checkpoint(step, str(ckpt_path))
 
     final_path = ckpt_dir / "iql_final.pt"
     agent.save(final_path)
     print(f"[train_iql] training complete — final model: {final_path}")
+    if on_checkpoint:
+        on_checkpoint(total_steps, str(final_path))
 
     if wb:
         wb.finish()

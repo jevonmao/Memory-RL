@@ -22,12 +22,15 @@ Confirmed H5 format (verified via inspect_h5 on record_dataset_PickXtimes.h5):
             info/
                 is_completed: () bool
 
-Transitions:
-    obs      = episode root obs  (or previous timestep obs)
+Transitions built by _read_episode:
+    obs      = timestep_K / obs   (observation the policy sees before taking action K)
     action   = timestep_K / action / joint_action
-    next_obs = timestep_K / obs
+    next_obs = timestep_{K+1} / obs  (or self-loop on the last / success step)
     reward   = float(timestep_K / info / is_completed)
     done     = reward > 0 or last timestep in episode
+
+Note: episode_root/obs is the initial observation and equals timestep_0/obs;
+it is not used in transition construction.
 
 obs_dim = 6 + 7 + 2 = 15   |   action_dim = 8
 """
@@ -216,7 +219,14 @@ class H5ReplayBuffer(Dataset):
         action_key: str = _DEFAULT_ACTION_KEY,
         max_transitions: Optional[int] = None,
         reward_scale: float = 1.0,
+        split: str = "all",
+        val_fraction: float = 0.2,
+        action_mean: Optional[np.ndarray] = None,
+        action_std: Optional[np.ndarray] = None,
     ):
+        if split not in ("all", "train", "val"):
+            raise ValueError(f"split must be 'all', 'train', or 'val', got '{split}'")
+
         bufs: Dict[str, List[np.ndarray]] = {
             k: [] for k in ("obs", "next_obs", "actions", "rewards", "dones")
         }
@@ -228,11 +238,27 @@ class H5ReplayBuffer(Dataset):
             if not path.exists():
                 raise FileNotFoundError(f"H5 file not found: {path}")
             with h5py.File(path, "r") as f:
-                for ep_key in f.keys():
+                # Collect and sort episode keys for a deterministic, reproducible split.
+                all_ep_keys = sorted(
+                    (k for k in f.keys() if isinstance(f[k], h5py.Group)),
+                    key=_timestep_index,
+                )
+
+                if split == "all" or not all_ep_keys:
+                    ep_keys = all_ep_keys
+                else:
+                    n_val   = max(1, int(len(all_ep_keys) * val_fraction))
+                    n_train = len(all_ep_keys) - n_val
+                    ep_keys = all_ep_keys[:n_train] if split == "train" else all_ep_keys[n_train:]
+                    print(
+                        f"[H5ReplayBuffer] split={split}  "
+                        f"episodes: train={n_train} val={n_val}  "
+                        f"using {len(ep_keys)}"
+                    )
+
+                for ep_key in ep_keys:
                     if max_transitions and total >= max_transitions:
                         break
-                    if not isinstance(f[ep_key], h5py.Group):
-                        continue
                     ep = _read_episode(f[ep_key], obs_keys, action_key)
                     if ep is None:
                         continue
@@ -261,6 +287,22 @@ class H5ReplayBuffer(Dataset):
 
         self.obs_dim    = self.obs.shape[1]
         self.action_dim = self.actions.shape[1]
+
+        # Normalize actions to zero mean / unit variance.
+        # If stats are provided (e.g. from the train split checkpoint) use them
+        # directly so train and val are on the same scale.
+        if action_mean is not None and action_std is not None:
+            self.action_mean: np.ndarray = action_mean.astype(np.float32)
+            self.action_std:  np.ndarray = action_std.astype(np.float32)
+        else:
+            self.action_mean = self.actions.mean(dim=0).numpy().astype(np.float32)
+            self.action_std  = self.actions.std(dim=0).numpy().astype(np.float32)
+            self.action_std  = np.clip(self.action_std, 1e-6, None)
+
+        mean_t = torch.from_numpy(self.action_mean)
+        std_t  = torch.from_numpy(self.action_std)
+        self.actions = (self.actions - mean_t) / std_t
+
         n_success = int((self.rewards > 0).sum().item())
         print(
             f"[H5ReplayBuffer] {n_eps} episodes | {len(self):,} transitions | "
@@ -304,15 +346,23 @@ def make_dataloader(
     max_transitions: Optional[int] = None,
     reward_scale: float = 1.0,
     pin_memory: bool = True,
+    split: str = "all",
+    val_fraction: float = 0.2,
+    action_mean: Optional[np.ndarray] = None,
+    action_std: Optional[np.ndarray] = None,
 ) -> Tuple["DataLoader", int, int]:
-    """Build a DataLoader for IQL training. Returns (loader, obs_dim, action_dim)."""
+    """Build a DataLoader for IQL training/eval. Returns (loader, obs_dim, action_dim).
+
+    split: "all" uses every episode; "train" / "val" applies an 80/20 episode-level
+    split deterministically by sorted episode key. val_fraction controls the ratio.
+    """
     paths = find_h5_files(data_dir, task)
     if not paths:
         raise FileNotFoundError(
             f"No H5 files found for task '{task}' in {data_dir}.\n"
             "Run: modal run modal_app/app.py::download_data"
         )
-    print(f"[make_dataloader] task='{task}'  {len(paths)} file(s): "
+    print(f"[make_dataloader] task='{task}'  split='{split}'  {len(paths)} file(s): "
           f"{[p.name for p in paths]}")
 
     dataset = H5ReplayBuffer(
@@ -321,6 +371,10 @@ def make_dataloader(
         action_key=action_key,
         max_transitions=max_transitions,
         reward_scale=reward_scale,
+        split=split,
+        val_fraction=val_fraction,
+        action_mean=action_mean,
+        action_std=action_std,
     )
     loader = DataLoader(
         dataset,
