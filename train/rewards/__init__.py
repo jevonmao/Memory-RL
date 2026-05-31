@@ -24,4 +24,21 @@ def make_reward(env_id: str):
     if env_id == "BinFill":
         from .binfill import BinFillReward
         return BinFillReward()
+    if env_id == "PickXtimes":
+        # Reward version is selected by the ROBOMME_REWARD_VERSION env var
+        # to allow training the v1 and v2 reward schedules in parallel
+        # under different OUTDIR roots without code edits.
+        import os
+        v = os.environ.get("ROBOMME_REWARD_VERSION", "v1")
+        if v == "v2":
+            from .pickxtimes_v2 import PickXtimesRewardV2
+            return PickXtimesRewardV2()
+        if v == "v3":
+            from .pickxtimes_v3 import PickXtimesRewardV3
+            return PickXtimesRewardV3()
+        if v == "v4":
+            from .pickxtimes_v4 import PickXtimesRewardV4
+            return PickXtimesRewardV4()
+        from .pickxtimes import PickXtimesReward
+        return PickXtimesReward()
     return None

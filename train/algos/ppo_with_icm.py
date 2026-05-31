@@ -94,6 +94,16 @@ class PPOWithICM(PPO):
         icm_actions: list[np.ndarray] = []
         intr_log:    list[float]      = []
 
+        # Cache feat_t across the rollout: feat_tp1 of step N becomes feat_t
+        # of step N+1, so we only need ONE extract_features per env step
+        # instead of two. Seeded with a fresh extraction on the very first
+        # _last_obs of this rollout. (Don't reuse across rollouts because
+        # the policy may have just been updated.)
+        with th.no_grad():
+            cached_feat_t = self.policy.extract_features(
+                obs_as_tensor(self._last_obs, self.device)
+            )
+
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 self.policy.reset_noise(env.num_envs)
@@ -118,9 +128,7 @@ class PPOWithICM(PPO):
 
             # ---- Online ICM intrinsic reward (eval-only — no grads here) ----
             with th.no_grad():
-                feat_t   = self.policy.extract_features(
-                    obs_as_tensor(self._last_obs, self.device)
-                )
+                feat_t   = cached_feat_t
                 feat_tp1 = self.policy.extract_features(
                     obs_as_tensor(new_obs, self.device)
                 )
@@ -129,6 +137,7 @@ class PPOWithICM(PPO):
                     actions_np, dtype=th.float32, device=self.device
                 )
                 _, _, intr = self.icm(feat_t, actions_t, feat_tp1)
+            cached_feat_t = feat_tp1   # reuse on the next iteration
             intr_np = intr.cpu().numpy().astype(rewards.dtype, copy=False)
             rewards = rewards + self.eta * intr_np
             intr_log.append(float(intr_np.mean()))

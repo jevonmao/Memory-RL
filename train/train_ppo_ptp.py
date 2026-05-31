@@ -43,6 +43,9 @@ def parse_args():
     p.add_argument("--task",        default="BinFill")
     p.add_argument("--timesteps",   type=int,   default=1_000_000)
     p.add_argument("--n_envs",      type=int,   default=4)
+    p.add_argument("--vec_env",     choices=["auto", "dummy", "subproc"], default="auto",
+                   help="VecEnv backend. 'auto' picks subproc when n_envs>1; "
+                        "fall back to 'dummy' if SAPIEN/Vulkan can't init in subprocesses on Windows.")
     p.add_argument("--n_steps",     type=int,   default=2048)
     p.add_argument("--batch_size",  type=int,   default=256)
     p.add_argument("--n_epochs",    type=int,   default=4)
@@ -73,8 +76,14 @@ def main():
             ))
         return _init
 
-    VecEnvCls = DummyVecEnv if platform.system() == "Windows" else SubprocVecEnv
-    vec_env = VecEnvCls([make_env(i) for i in range(args.n_envs)])
+    # See train_ppo.py for the SubprocVecEnv-on-Windows rationale.
+    if args.vec_env == "dummy" or args.n_envs == 1:
+        vec_env = DummyVecEnv([make_env(i) for i in range(args.n_envs)])
+    else:
+        vec_env = SubprocVecEnv(
+            [make_env(i) for i in range(args.n_envs)],
+            start_method="spawn",
+        )
     vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True,
                            clip_reward=10.0, gamma=args.gamma)
 

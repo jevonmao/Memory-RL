@@ -45,12 +45,18 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model",    required=True,
                    help="Path to a .zip SB3 model file")
-    p.add_argument("--baseline", choices=["ppo", "icm", "ptp"], default="ppo",
-                   help="Which baseline (determines obs format)")
+    p.add_argument("--baseline", choices=["ppo", "icm", "ptp", "recurrent"], default="ppo",
+                   help="Which baseline (determines obs format + load path)")
     p.add_argument("--tasks",    nargs="+", default=["BinFill"],
                    help="Task name(s) or 'all'")
-    p.add_argument("--n_eval",   type=int, default=20,
-                   help="Number of test episodes per task")
+    p.add_argument("--n_eval",   type=int, default=10,
+                   help="Number of test episodes per task. "
+                        "Default matches challenge_interface/scripts/phase1_eval.py "
+                        "Phase 1 evaluation count.")
+    p.add_argument("--max_steps", type=int, default=1500,
+                   help="Per-episode step cap. 1500 matches the official "
+                        "RoboMME Challenge horizon (challenge_interface/scripts/"
+                        "phase1_eval.py); 500 matches the legacy training horizon.")
     p.add_argument("--K",        type=int, default=8,
                    help="History length for PTP baseline")
     p.add_argument("--device",   default="auto")
@@ -87,13 +93,15 @@ def _add_batch(obs: dict) -> dict:
     return {k: np.expand_dims(v, 0) for k, v in obs.items()}
 
 
-def evaluate_task(model, task: str, n_eval: int, baseline: str, K: int) -> dict:
+def evaluate_task(model, task: str, n_eval: int, baseline: str, K: int,
+                  max_steps: int = 1500) -> dict:
     from collections import deque
     import numpy as np
     from train.envs.rl_env import STATE_DIM, ACTION_DIM
 
     builder   = BenchmarkEnvBuilder(task, dataset="test",
-                                    action_space="joint_angle", max_steps=500)
+                                    action_space="joint_angle",
+                                    max_steps=max_steps)
     n_ep      = builder.get_episode_num()
     n_run     = min(n_eval, n_ep) if n_ep > 0 else n_eval
 
@@ -120,6 +128,12 @@ def evaluate_task(model, task: str, n_eval: int, baseline: str, K: int) -> dict:
             state_buf.clear()
             action_buf.clear()
 
+        # RecurrentPPO carries an LSTM hidden state across an episode.
+        # state=None at first call → model uses the LSTM's initial zero state.
+        # episode_start=True signals the policy to reset its hidden state.
+        lstm_state = None
+        ep_start = True
+
         ep_return = 0.0
         done = False
 
@@ -130,8 +144,22 @@ def evaluate_task(model, task: str, n_eval: int, baseline: str, K: int) -> dict:
                 state_buf.append(state)
                 obs = {**obs, **_get_history()}
 
-            action, _ = model.predict(_add_batch(obs), deterministic=True)
+            if baseline == "recurrent":
+                action, lstm_state = model.predict(
+                    _add_batch(obs),
+                    state=lstm_state,
+                    episode_start=np.array([ep_start], dtype=bool),
+                    deterministic=True,
+                )
+                ep_start = False
+            else:
+                action, _ = model.predict(_add_batch(obs), deterministic=True)
             action = action[0]
+            # Match training: RobommeRLEnv.step clips actions to [-1, 1] before
+            # passing to mani_skill. Without this clip the unbounded recurrent
+            # Gaussian-mean output reaches mani_skill as-is, which is a
+            # train-time distribution shift.
+            action = np.clip(action, -1.0, 1.0).astype(np.float32)
 
             raw_obs, reward, terminated, truncated, info = env.step(action)
             rew = float(reward.cpu().item() if hasattr(reward, "cpu") else reward)
@@ -156,18 +184,107 @@ def evaluate_task(model, task: str, n_eval: int, baseline: str, K: int) -> dict:
     }
 
 
+def _load_ppo_with_encoder_autodetect(model_path: str, device: str):
+    """
+    Load an SB3 PPO checkpoint, falling back to the legacy dual-ResNet18
+    extractor for checkpoints saved before the shared-backbone refactor
+    (e.g. ppo_v2 / ppo_v3 / ppo_v4).
+
+    SB3's PPO.load reconstructs the policy from the saved policy_kwargs,
+    which include features_extractor_class as a class reference. For old
+    checkpoints that reference RobommeCNNExtractor at construction time
+    but were saved with the legacy state-dict layout, we override via
+    `custom_objects={"policy_kwargs": ...}` after peeking at the layout.
+    """
+    import zipfile, pickle, io, torch as th
+    from train.models.encoder import (
+        RobommeCNNExtractor,
+        RobommeCNNExtractorLegacy,
+        detect_encoder_layout,
+    )
+
+    # Peek at the policy's state_dict to decide which extractor class fits.
+    with zipfile.ZipFile(model_path) as zf:
+        with zf.open("policy.pth") as f:
+            policy_sd = th.load(io.BytesIO(f.read()), map_location="cpu", weights_only=True)
+        with zf.open("data") as f:
+            data_blob = f.read()
+
+    layout = detect_encoder_layout(policy_sd.keys())
+    print(f"  detected encoder layout: {layout}")
+
+    if layout == "new":
+        return PPO.load(model_path, device=device)
+
+    # legacy: rewrite policy_kwargs.features_extractor_class to point at
+    # RobommeCNNExtractorLegacy, then have PPO.load consume the override
+    # via custom_objects (which SB3 substitutes into the saved data dict).
+    target_kwargs = {
+        "features_extractor_class": RobommeCNNExtractorLegacy,
+        # net_arch and squash_output should already be saved correctly;
+        # we only need to swap the extractor. SB3's load_from_zip_file
+        # merges custom_objects into the unpickled data, so we must
+        # provide the FULL policy_kwargs dict not a partial one — read
+        # it out of the data blob first.
+    }
+    # Decode the SB3 data blob to read existing policy_kwargs.
+    from stable_baselines3.common.save_util import json_to_data
+    saved_data = json_to_data(data_blob.decode("utf-8"))
+    saved_pk = dict(saved_data.get("policy_kwargs", {}))
+    saved_pk["features_extractor_class"] = RobommeCNNExtractorLegacy
+    return PPO.load(
+        model_path,
+        device=device,
+        custom_objects={"policy_kwargs": saved_pk},
+    )
+
+
+def _resolve_vecnorm(model_path: str) -> "Optional[str]":
+    """Find a sibling vecnormalize.pkl next to the model, if any.
+
+    train_ppo*.py saves it to `<outdir>/vecnormalize.pkl`; checkpoints in
+    `<outdir>/ckpts/*.zip` look one level up.
+    """
+    from pathlib import Path
+    p = Path(model_path).resolve()
+    for cand in (p.parent / "vecnormalize.pkl",
+                 p.parent.parent / "vecnormalize.pkl"):
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def main():
     args = parse_args()
 
     tasks = ALL_TASKS if (len(args.tasks) == 1 and args.tasks[0] == "all") else args.tasks
 
-    model = PPO.load(args.model, device=args.device)
+    if args.baseline == "recurrent":
+        from sb3_contrib import RecurrentPPO
+        model = RecurrentPPO.load(args.model, device=args.device)
+    else:
+        model = _load_ppo_with_encoder_autodetect(args.model, args.device)
     model.policy.set_training_mode(False)
+
+    # VecNormalize: our training scripts use VecNormalize(norm_obs=False,
+    # norm_reward=True). Eval reports success_rate via info["success"] and
+    # ignores env reward entirely, so reward normalization has zero effect
+    # on the SR number we report. The policy/value net was trained with
+    # norm_obs=False so observations need no transform either. We therefore
+    # do NOT load `vecnormalize.pkl` here — the model.predict(raw_obs)
+    # path is correct as-is. If a future run flips norm_obs to True, this
+    # branch must be revisited (the policy would expect normalized obs).
+    vecnorm_path = _resolve_vecnorm(args.model)
+    if vecnorm_path:
+        print(f"  found {vecnorm_path}  (intentionally NOT loaded — "
+              "see comment in evaluate_trained.main; affects only train-time "
+              "reward scaling, which doesn't influence SR)")
 
     all_results = []
     for task in tasks:
-        print(f"\n=== Evaluating {task} ===")
-        result = evaluate_task(model, task, args.n_eval, args.baseline, args.K)
+        print(f"\n=== Evaluating {task} (max_steps={args.max_steps}) ===")
+        result = evaluate_task(model, task, args.n_eval, args.baseline, args.K,
+                               max_steps=args.max_steps)
         all_results.append(result)
         print(f"  success_rate={result['success_rate']:.3f}  mean_return={result['mean_return']:.2f}")
 

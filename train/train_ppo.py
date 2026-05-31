@@ -33,6 +33,9 @@ def parse_args():
     p.add_argument("--task",       default="BinFill")
     p.add_argument("--timesteps",  type=int,   default=1_000_000)
     p.add_argument("--n_envs",     type=int,   default=4)
+    p.add_argument("--vec_env",    choices=["auto", "dummy", "subproc"], default="auto",
+                   help="VecEnv backend. 'auto' picks subproc when n_envs>1 (true parallelism); "
+                        "fall back to 'dummy' if SAPIEN/Vulkan can't init in subprocesses on Windows.")
     p.add_argument("--n_steps",    type=int,   default=2048)
     p.add_argument("--batch_size", type=int,   default=256)
     p.add_argument("--n_epochs",   type=int,   default=4)
@@ -70,9 +73,17 @@ def main():
             return Monitor(RobommeRLEnv(env_id=args.task, seed=args.seed + rank))
         return _init
 
-    # SubprocVecEnv crashes on Windows (ERROR_COMMITMENT_LIMIT shared mapping bug)
-    VecEnvCls = DummyVecEnv if platform.system() == "Windows" else SubprocVecEnv
-    vec_env = VecEnvCls([make_env(i) for i in range(args.n_envs)])
+    # Pick VecEnv backend. Historical note: an early version forced DummyVecEnv
+    # on Windows after hitting "ERROR_COMMITMENT_LIMIT" with SubprocVecEnv +
+    # default start method. start_method="spawn" (Python's Windows default)
+    # plus initialising SAPIEN inside each child has been observed to work.
+    if args.vec_env == "dummy" or args.n_envs == 1:
+        vec_env = DummyVecEnv([make_env(i) for i in range(args.n_envs)])
+    else:
+        vec_env = SubprocVecEnv(
+            [make_env(i) for i in range(args.n_envs)],
+            start_method="spawn",
+        )
 
     # Reward normalization stabilizes PPO when reward magnitude is unknown.
     # Obs is left raw (already in fixed dtypes, images normalized by SB3).

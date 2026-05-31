@@ -12,6 +12,7 @@ registered. See plan: F1-F3, train/rewards/binfill.py.
 from __future__ import annotations
 
 import gc
+import os
 import platform
 import subprocess
 from collections import deque
@@ -21,6 +22,25 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+
+# Default to obs_mode="rgb" for RL: we only read RGB + proprio, and skipping
+# the depth+segmentation render passes roughly halves SAPIEN's per-step GPU
+# work. This is a pure throughput optimization — the wrapper only ever reads
+# RGB anyway, so the trained policy sees identical observations regardless.
+# Override (e.g. ROBOMME_OBS_MODE=rgb+depth+segmentation) if a downstream
+# consumer needs the extra modalities.
+os.environ.setdefault("ROBOMME_OBS_MODE", "rgb")
+# NOTE: we intentionally do NOT default ROBOMME_CAMERA_RES or ROBOMME_SIM_FREQ.
+#   * ROBOMME_CAMERA_RES would change SAPIEN's native render resolution
+#     (default 256 → resize to 128 in wrapper). Setting it to 128 native
+#     gives a small (~5%) GPU speedup but introduces a distribution shift
+#     vs the official eval, which renders at 256 native.
+#   * ROBOMME_SIM_FREQ would change physx_cpu substeps per env.step
+#     (default 100 → 40 gives ~14% CPU speedup) but changes the physics
+#     fidelity the policy is trained against. Official eval uses 100.
+# Both env vars are still honored by episode_config_resolver if explicitly
+# set — they are useful for fast smoke tests or for runs that don't need
+# to compare against the official leaderboard.
 
 from robomme.env_record_wrapper import BenchmarkEnvBuilder
 from train.rewards import make_reward
@@ -97,7 +117,14 @@ class RobommeRLEnv(gym.Env):
     def __init__(self,
                  env_id: str = "BinFill",
                  seed: int = 0,
-                 shape_reward: bool = True):
+                 shape_reward: bool = True,
+                 max_steps: int = 1500):
+        """
+        max_steps defaults to 1500 to match the official RoboMME Challenge
+        evaluation horizon (challenge_interface/scripts/phase1_eval.py).
+        Override for fast smoke/iteration runs where you knowingly don't
+        need policies that can complete full-length episodes.
+        """
         super().__init__()
         self.env_id = env_id
         self._rng = np.random.default_rng(seed)
@@ -105,7 +132,7 @@ class RobommeRLEnv(gym.Env):
             env_id=env_id,
             dataset="train",
             action_space="joint_angle",
-            max_steps=500,
+            max_steps=max_steps,
         )
         self._num_episodes = self._builder.get_episode_num()
         if self._num_episodes <= 0:
@@ -139,18 +166,27 @@ class RobommeRLEnv(gym.Env):
         self._pos += 1
         return ep
 
+    # Reset counter for amortized VRAM cleanup.
+    _resets_since_gc: int = 0
+    _GC_EVERY: int = 32
+
     def _release_env(self) -> None:
         """Tear down the current inner env without calling its .close().
 
         ManiSkill's close() path appears to leak VRAM when paired with
-        gym.make() of a fresh env; dropping the reference and forcing GC
-        keeps VRAM flat across many resets.
+        gym.make() of a fresh env; dropping the reference is enough to
+        keep VRAM growth bounded. gc.collect() + cuda.empty_cache() are
+        expensive (10–30 ms each) so we rate-limit them — running every
+        reset is wasted work when episodes are 500 steps long.
         """
         if self._env is not None:
             self._env = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._resets_since_gc += 1
+            if self._resets_since_gc >= self._GC_EVERY:
+                self._resets_since_gc = 0
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def reset(self, *, seed=None, options=None):
         # Reseed the episode-order RNG if SB3 passes one through.
@@ -211,8 +247,10 @@ class RobommeRLEnvWithMemory(RobommeRLEnv):
                  env_id: str = "BinFill",
                  seed: int = 0,
                  K: int = 8,
-                 shape_reward: bool = True):
-        super().__init__(env_id=env_id, seed=seed, shape_reward=shape_reward)
+                 shape_reward: bool = True,
+                 max_steps: int = 1500):
+        super().__init__(env_id=env_id, seed=seed, shape_reward=shape_reward,
+                         max_steps=max_steps)
         self.K = K
         self._state_buf:  deque[np.ndarray] = deque(maxlen=K)
         self._action_buf: deque[np.ndarray] = deque(maxlen=K)

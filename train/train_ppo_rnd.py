@@ -1,15 +1,14 @@
 """
-Baseline 2: PPO + Intrinsic Curiosity Module (ICM).
+Baseline B4: PPO + Random Network Distillation (RND).
 
-The ICM is owned by the algorithm itself (`PPOWithICM`) rather than a callback,
-because SB3 computes advantages before any callback fires; a callback-based
-intrinsic injection is silently a no-op for the policy. See
-train/algos/ppo_with_icm.py for the full explanation.
+Same wiring as train_ppo_icm.py but swaps the curiosity module:
+  * ICM saturates fast (forward-model error decays as the model fits)
+  * RND novelty is bounded only by what the predictor has seen, so it does
+    not saturate on the *unseen* states we need exploration to reach.
 
 Usage:
-    python -m train.train_ppo_icm --task BinFill --timesteps 1_000_000 --wandb
-    # Resume from the newest checkpoint in <outdir>/ckpts:
-    python -m train.train_ppo_icm --resume latest --outdir runs/ppo_icm_v5 ...
+    python -m train.train_ppo_rnd --task PickXtimes --timesteps 1_000_000 --wandb
+    python -m train.train_ppo_rnd --resume latest --outdir runs/ppo_rnd_v1 ...
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import platform
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -26,10 +24,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNorm
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
-from train.algos.ppo_with_icm import PPOWithICM
+from train.algos.ppo_with_rnd import PPOWithRND
 from train.envs.rl_env import RobommeRLEnv
 from train.models.encoder import RobommeCNNExtractor
-from train.models.icm import ICM
+from train.models.rnd import RND
 from train.wandb_utils import add_wandb_args, init_wandb, finish_wandb
 
 
@@ -38,48 +36,40 @@ VECNORM_FILE = "vecnormalize.pkl"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--task",       default="BinFill")
+    p.add_argument("--task",       default="PickXtimes")
     p.add_argument("--timesteps",  type=int,   default=1_000_000)
     p.add_argument("--n_envs",     type=int,   default=4)
-    p.add_argument("--vec_env",    choices=["auto", "dummy", "subproc"], default="auto",
-                   help="VecEnv backend. 'auto' picks subproc when n_envs>1; "
-                        "fall back to 'dummy' if SAPIEN/Vulkan can't init in subprocesses on Windows.")
+    p.add_argument("--vec_env",    choices=["auto", "dummy", "subproc"], default="auto")
     p.add_argument("--n_steps",    type=int,   default=2048)
     p.add_argument("--batch_size", type=int,   default=256)
     p.add_argument("--n_epochs",   type=int,   default=4)
     p.add_argument("--target_kl",  type=float, default=0.05)
     p.add_argument("--lr",         type=float, default=3e-4)
-    p.add_argument("--icm_lr",     type=float, default=3e-4)
-    p.add_argument("--eta",        type=float, default=0.01,
-                   help="Intrinsic reward scale")
-    p.add_argument("--icm_beta",   type=float, default=0.2,
-                   help="ICM loss weighting (β*L_fwd + (1-β)*L_inv)")
+    p.add_argument("--rnd_lr",     type=float, default=1e-4)
+    p.add_argument("--eta",        type=float, default=1.0,
+                   help="Intrinsic reward scale (RND auto-normalises so ~1 works).")
+    p.add_argument("--rnd_gamma",  type=float, default=0.99,
+                   help="Discount for intrinsic-return RMS (decoupled from policy γ).")
     p.add_argument("--gamma",      type=float, default=0.997)
     p.add_argument("--ent_coef",   type=float, default=0.01)
-    p.add_argument("--outdir",     default="runs/ppo_icm_v3")
+    p.add_argument("--outdir",     default="runs/ppo_rnd_v1")
     p.add_argument("--device",     default="auto")
     p.add_argument("--seed",       type=int,   default=0)
     p.add_argument("--resume",     default=None,
-                   help="Path to a PPO checkpoint .zip to resume from. "
-                        "Use 'latest' to auto-pick the newest ckpt in <outdir>/ckpts. "
-                        "The sibling <ckpt>_icm.pt is loaded if present.")
+                   help="Path to a PPO checkpoint .zip, or 'latest'.")
     add_wandb_args(p)
     return p.parse_args()
 
 
 def _find_latest_ckpt(ckpt_dir):
-    """Return the newest 'ppo_icm_<task>_<steps>_steps.zip' under ckpt_dir."""
     ckpts = glob.glob(os.path.join(ckpt_dir, "*_steps.zip"))
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
     return max(ckpts, key=lambda p: int(p.rsplit("_", 2)[-2]))
 
 
-class ICMCheckpointCallback(BaseCallback):
-    """Saves ICM weights every save_freq calls, mirroring CheckpointCallback's cadence.
-
-    Matches the sibling .zip's basename so _resume can pair them up.
-    """
+class RNDCheckpointCallback(BaseCallback):
+    """Snapshot the RND module alongside the PPO .zip checkpoints."""
 
     def __init__(self, save_freq: int, save_path: str, name_prefix: str):
         super().__init__(verbose=0)
@@ -90,10 +80,9 @@ class ICMCheckpointCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq != 0:
             return True
-        ckpt_steps = self.num_timesteps
-        path = os.path.join(self.save_path, f"{self.name_prefix}_{ckpt_steps}_steps_icm.pt")
+        path = os.path.join(self.save_path, f"{self.name_prefix}_{self.num_timesteps}_steps_rnd.pt")
         os.makedirs(self.save_path, exist_ok=True)
-        torch.save(self.model.icm.state_dict(), path)
+        torch.save(self.model.rnd.state_dict(), path)
         return True
 
 
@@ -106,7 +95,6 @@ def main():
             return Monitor(RobommeRLEnv(env_id=args.task, seed=args.seed + rank))
         return _init
 
-    # See train_ppo.py for the SubprocVecEnv-on-Windows rationale.
     if args.vec_env == "dummy" or args.n_envs == 1:
         vec_env = DummyVecEnv([make_env(i) for i in range(args.n_envs)])
     else:
@@ -124,9 +112,9 @@ def main():
         squash_output=True,
     )
 
-    icm = ICM(feat_dim=576, action_dim=8, hidden=256)
+    rnd = RND(feat_dim=576, out_dim=128, hidden=256)
 
-    model = PPOWithICM(
+    model = PPOWithRND(
         policy="MultiInputPolicy",
         env=vec_env,
         learning_rate=args.lr,
@@ -143,57 +131,48 @@ def main():
         verbose=1,
         tensorboard_log=os.path.join(args.outdir, "tb"),
         seed=args.seed,
-        # ICM-specific
-        icm=icm,
+        rnd=rnd,
         eta=args.eta,
-        icm_lr=args.icm_lr,
-        icm_beta=args.icm_beta,
+        rnd_lr=args.rnd_lr,
+        rnd_gamma=args.rnd_gamma,
     )
 
-    # Resume from a previous run: policy/value weights via set_parameters,
-    # num_timesteps restored from the zip's filename, ICM weights from the
-    # sibling .pt file. We don't use PPO.load classmethod because PPOWithICM
-    # requires `icm` at construction time and load() doesn't accept extra kwargs.
     if args.resume:
         ckpt = (_find_latest_ckpt(os.path.join(args.outdir, "ckpts"))
                 if args.resume == "latest" else args.resume)
         print(f"Resuming from PPO checkpoint: {ckpt}")
         model.set_parameters(ckpt, exact_match=True, device=args.device)
-        # Recover num_timesteps from filename: ppo_icm_<task>_<steps>_steps.zip
         try:
             resumed_steps = int(os.path.basename(ckpt).rsplit("_", 2)[-2])
             model.num_timesteps = resumed_steps
             print(f"  resumed at num_timesteps={resumed_steps}")
         except (ValueError, IndexError):
-            print("  warning: could not parse step count from filename; "
-                  "num_timesteps stays at 0")
-        # ICM weights: try the sibling _icm.pt produced by ICMCheckpointCallback,
-        # then fall back to <ckpt-without-zip>_icm.pt (final-save convention).
-        icm_pt = ckpt.replace(".zip", "_icm.pt")
-        if not os.path.exists(icm_pt):
-            icm_pt = ckpt[:-len("_steps.zip")] + "_icm.pt"
-        if os.path.exists(icm_pt):
-            print(f"  loading ICM weights from {icm_pt}")
-            model.icm.load_state_dict(torch.load(icm_pt, map_location=args.device))
+            print("  warning: could not parse step count from filename")
+        rnd_pt = ckpt.replace(".zip", "_rnd.pt")
+        if not os.path.exists(rnd_pt):
+            rnd_pt = ckpt[:-len("_steps.zip")] + "_rnd.pt"
+        if os.path.exists(rnd_pt):
+            print(f"  loading RND weights from {rnd_pt}")
+            model.rnd.load_state_dict(torch.load(rnd_pt, map_location=args.device))
         else:
-            print(f"  WARNING: no ICM checkpoint at {icm_pt} — ICM starts from scratch")
+            print(f"  WARNING: no RND checkpoint at {rnd_pt} — RND starts from scratch")
 
     save_freq = max(100_000 // args.n_envs, 1)
-    ckpt_cb = CheckpointCallback(
-        save_freq=save_freq,
-        save_path=os.path.join(args.outdir, "ckpts"),
-        name_prefix=f"ppo_icm_{args.task}",
-        save_replay_buffer=False,
-        save_vecnormalize=False,
-    )
-    icm_ckpt_cb = ICMCheckpointCallback(
-        save_freq=save_freq,
-        save_path=os.path.join(args.outdir, "ckpts"),
-        name_prefix=f"ppo_icm_{args.task}",
-    )
-
-    callbacks = [ckpt_cb, icm_ckpt_cb]
-    wandb_cb = init_wandb(args, baseline="ppo_icm", config=vars(args))
+    callbacks = [
+        CheckpointCallback(
+            save_freq=save_freq,
+            save_path=os.path.join(args.outdir, "ckpts"),
+            name_prefix=f"ppo_rnd_{args.task}",
+            save_replay_buffer=False,
+            save_vecnormalize=False,
+        ),
+        RNDCheckpointCallback(
+            save_freq=save_freq,
+            save_path=os.path.join(args.outdir, "ckpts"),
+            name_prefix=f"ppo_rnd_{args.task}",
+        ),
+    ]
+    wandb_cb = init_wandb(args, baseline="ppo_rnd", config=vars(args))
     if wandb_cb is not None:
         callbacks.append(wandb_cb)
 
@@ -204,8 +183,7 @@ def main():
             print(f"Already at {model.num_timesteps} >= target {args.timesteps}; nothing to do.")
             vec_env.close()
             return
-        print(f"Resuming at {model.num_timesteps} steps; training {remaining} more "
-              f"to reach {args.timesteps}.")
+        print(f"Resuming at {model.num_timesteps} steps; training {remaining} more.")
 
     model.learn(
         total_timesteps=remaining,
@@ -214,10 +192,9 @@ def main():
         reset_num_timesteps=not args.resume,
     )
 
-    save_path = os.path.join(args.outdir, f"ppo_icm_{args.task}_final")
+    save_path = os.path.join(args.outdir, f"ppo_rnd_{args.task}_final")
     model.save(save_path)
-    # Save ICM separately so it can be inspected / reloaded
-    torch.save(model.icm.state_dict(), save_path + "_icm.pt")
+    torch.save(model.rnd.state_dict(), save_path + "_rnd.pt")
     vec_env.save(os.path.join(args.outdir, VECNORM_FILE))
     print(f"Model saved to {save_path}")
     finish_wandb(args)

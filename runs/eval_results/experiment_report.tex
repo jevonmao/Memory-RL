@@ -1,0 +1,1039 @@
+% ============================================================
+%  RoboMME RL Experiment Report
+%  CS224R Final Project — Stanford, Spring 2026
+%  Compiled 2026-05-28
+% ============================================================
+\documentclass[11pt,letterpaper]{article}
+
+% --- Packages -----------------------------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{mdframed}
+
+% --- Colors -------------------------------------------------
+\definecolor{darkblue}{RGB}{10,50,120}
+\definecolor{darkred}{RGB}{150,20,20}
+\definecolor{darkgreen}{RGB}{20,100,40}
+\definecolor{lightgray}{RGB}{245,245,245}
+\definecolor{warningbg}{RGB}{255,248,220}
+
+% --- Hyperref -----------------------------------------------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=darkblue,
+  citecolor=darkgreen,
+  urlcolor=darkblue,
+  pdftitle={RoboMME RL Experiments — CS224R},
+  pdfauthor={Jevon Mao et al.}
+}
+
+% --- Header / Footer ----------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textcolor{gray}{\small RoboMME RL Experiments}}
+\lhead{\textcolor{gray}{\small CS224R — Spring 2026}}
+\rfoot{\thepage}
+
+% --- Section formatting -------------------------------------
+\titleformat{\section}{\large\bfseries\color{darkblue}}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\color{darkblue}}{}{0em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{}{0em}{}
+
+% --- Code listings ------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+% --- Custom environments ------------------------------------
+\newmdenv[
+  backgroundcolor=warningbg,
+  linecolor=orange!60!black,
+  linewidth=1pt,
+  leftmargin=0pt,
+  rightmargin=0pt,
+  innerleftmargin=8pt,
+  innerrightmargin=8pt,
+  innertopmargin=6pt,
+  innerbottommargin=6pt,
+  skipabove=6pt,
+  skipbelow=6pt
+]{finding}
+
+\newmdenv[
+  backgroundcolor=lightgray,
+  linecolor=gray!60,
+  linewidth=0.5pt,
+  leftmargin=0pt,
+  rightmargin=0pt,
+  innerleftmargin=8pt,
+  innerrightmargin=8pt,
+  innertopmargin=6pt,
+  innerbottommargin=6pt,
+  skipabove=6pt,
+  skipbelow=6pt
+]{codeblock}
+
+% ============================================================
+\begin{document}
+
+% --- Title page ---------------------------------------------
+\begin{titlepage}
+  \centering
+  \vspace*{1.5cm}
+  {\LARGE\bfseries\color{darkblue} RoboMME Reinforcement Learning Experiments}\\[0.4em]
+  {\large\color{gray} BinFill and PickXtimes — Full Experimental Trace}\\[2em]
+  {\normalsize CS224R Final Project $\cdot$ Stanford University $\cdot$ Spring 2026}\\[1em]
+  {\normalsize Compiled: 2026-05-28}\\[3em]
+
+  \begin{mdframed}[backgroundcolor=lightgray,linecolor=gray!50]
+  \textbf{Document purpose.}
+  This document is written for a project teammate who is joining at
+  the midpoint and needs a complete picture of what has been tried,
+  why each approach was chosen, what failed and why, and where the
+  strongest next steps lie. It covers every training run from the
+  initial BinFill PPO baseline through the seven-phase PickXtimes
+  ablation (BinFill: §\ref{sec:binfill}; PickXtimes: §\ref{sec:pickxtimes}).
+  All numbers are deterministic-eval success rates on held-out
+  test-split episodes unless stated otherwise.
+  \end{mdframed}
+
+  \vfill
+  {\small\textit{Generated from \texttt{REPORT.md}, \texttt{PICKXTIMES\_REPORT.md},
+  \texttt{EXPERIMENT\_LOG.md}, and \texttt{NEXT\_STEPS.md}.}}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Background and Task Descriptions}
+\label{sec:background}
+
+\subsection{RoboMME Benchmark}
+
+RoboMME is a manipulation benchmark testing memory and multi-step reasoning
+in robotic agents. A 7-DoF Panda arm with a parallel-jaw gripper operates in
+a physics simulation (SAPIEN / ManiSkill). The official evaluation criterion
+is a binary success rate averaged over multiple seeds and tasks.
+
+The benchmark ships with imitation-learning (IL) baselines only — no RL
+numbers exist in the paper. Reference IL numbers for context:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Method} & \textbf{BinFill SR} \\
+\midrule
+Human & 96.0\% \\
+GroundSG + Oracle (ground-truth info) & 85.8\% \\
+FrameSamp + Modul (best non-oracle) & 39.6\% \\
+\bottomrule
+\end{tabular}
+\caption{Published RoboMME paper baselines (IL, not RL).}
+\end{table}
+
+The closest published RL comparison is \textbf{MIKASA-Robo} (ICLR 2025), which
+benchmarks PPO-MLP, PPO-LSTM, SAC, and TD-MPC2 on 32 ManiSkill memory-manipulation
+tasks. Their key finding: \emph{``none of the models were able to successfully
+solve the majority of MIKASA-Robo tasks.''} PPO and PPO-LSTM collapsed to $\approx$0\%
+on harder memory tasks at standard training budgets (up to $\sim$5M steps).
+
+\subsection{Task: BinFill}
+\label{sec:binfill-task}
+
+A cluttered-scene manipulation task. The agent must:
+\begin{enumerate}[nosep]
+  \item Pick up multiple target cubes in a cluttered bin,
+  \item Place each in the target bin, and
+  \item Press a button to signal completion.
+\end{enumerate}
+BinFill is among the harder RoboMME tasks due to scene clutter.
+Episode horizon: \textbf{1500 steps} (official). Training initially used 500 steps
+— a significant mismatch identified post-training.
+
+\subsection{Task: PickXtimes}
+\label{sec:pickxtimes-task}
+
+A multi-step pick-and-place task with a counting requirement:
+\begin{enumerate}[nosep]
+  \item Pick up a specified target cube \textbf{N times} ($N = 1$–$5$, sampled
+        per episode by \texttt{seed \% 3}: easy / medium / hard difficulty).
+  \item After each pickup, place it on a target pad.
+  \item Press a button to stop.
+\end{enumerate}
+
+Total subgoals per episode: $2N + 1$ (range: 3–11).
+Episode horizon: \textbf{1500 steps}.
+Failure conditions: picking the wrong cube or pressing the button before completing
+all cycles.
+
+\paragraph{Observation space.}
+128$\times$128 front + wrist RGB images $\oplus$ 7-D joint state $\oplus$ 6-D EEF
+state $\oplus$ 2-D gripper state (\texttt{obs\_mode=rgb}).
+
+\paragraph{Action space.}
+8-D continuous in $[-1, 1]$: 7 joint $q_\text{pos}$ targets $+$ 1 gripper command.
+\texttt{normalize\_action=False} — $[-1, 1]$ is the literal joint-target range,
+clamped by the wrapper before stepping ManiSkill.
+
+\paragraph{Why PickXtimes?}
+It isolates \emph{both} memory and curiosity axes cleanly:
+\begin{itemize}[nosep]
+  \item \textbf{Memory}: the agent must count pickups — a purely reactive policy
+        caps at $1/N$ success at best.
+  \item \textbf{Curiosity}: sparse extrinsic reward requires the agent to discover
+        the repeated pick primitive.
+  \item \textbf{Motor}: a single object type and one primitive — moderate difficulty,
+        not the primary bottleneck.
+\end{itemize}
+
+% ============================================================
+\section{Shared Infrastructure}
+
+\subsection{Hardware and Software}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Details} \\
+\midrule
+Cluster & Stanford SC — partitions \texttt{svl}/\texttt{svl-interactive}/\texttt{visionlab} \\
+GPU & NVIDIA Titan RTX (24 GB) \\
+Local dev & NVIDIA RTX 4090, WSL2 (code dev only; SAPIEN smoke tests on cluster) \\
+Python & 3.11 \\
+PyTorch & 2.9.1+cu121 \\
+SB3 / sb3-contrib & stable\_baselines3 2.8.0 / sb3-contrib 2.8.0 \\
+ManiSkill & 3.0.0b21 (YinpeiDai fork, git rev \texttt{07be6fbc}) \\
+SAPIEN & 3.0.2 \\
+\midrule
+\multicolumn{2}{l}{\textbf{Required env var:} \texttt{ROBOMME\_SIM\_BACKEND=physx\_cpu}} \\
+\multicolumn{2}{l}{SAPIEN 3.0.3 + torch 2.9 trip a \texttt{\_\_cuda\_array\_interface\_\_} typestr} \\
+\multicolumn{2}{l}{parse error in \texttt{articulation\_joint.drive\_target} on GPU sim.} \\
+\multicolumn{2}{l}{CPU sim runs at 60–75 FPS aggregate at \texttt{n\_envs=4} on Titan RTX.} \\
+\bottomrule
+\end{tabular}
+\caption{Environment. All cluster jobs export \texttt{ROBOMME\_SIM\_BACKEND=physx\_cpu}.}
+\end{table}
+
+\subsection{Shared Visual Backbone}
+
+All policies share a \textbf{ResNet-18 CNN feature extractor} (\texttt{RobommeCNNExtractor})
+with per-camera projection heads outputting a 576-dimensional joint feature vector,
+shared between actor and critic.
+
+\subsection{Policy Architecture Variants}
+
+\begin{description}[leftmargin=2em]
+  \item[PPO (vanilla)] MLP head on the 576-d extractor features.
+  \item[PPO+ICM] Same as PPO + Pathak ICM: forward-dynamics MSE as intrinsic reward.
+        Intrinsic return normalized by running std (Burda 2018 recipe).
+  \item[RecurrentPPO (LSTM)] 576-d features $\to$ LSTM (hidden=256, 1 layer, shared
+        actor/critic) $\to$ policy/value MLPs. Implemented via \texttt{sb3-contrib}
+        \texttt{MultiInputLstmPolicy}.
+  \item[RND] Predictor + frozen-random target, both 4-layer MLP heads on 576-d
+        features. Intrinsic reward $= \|\text{predictor}(\phi) - \text{target}(\phi)\|^2$,
+        normalized by running std of intrinsic returns. Predictor gradient does
+        \emph{not} flow into the shared extractor.
+  \item[RecurrentPPO+RND] Combines LSTM memory with RND intrinsic reward.
+\end{description}
+
+% ============================================================
+\section{BinFill Experiments}
+\label{sec:binfill}
+
+\subsection{Training Configurations}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Run} & \textbf{Baseline} & \textbf{Key config} \\
+\midrule
+\texttt{ppo\_v2} & Vanilla PPO (original reward stub) & 500 steps, reward stub \\
+\texttt{ppo\_v3} & Vanilla PPO (v3 shaping) & 500 steps, negative shaping \\
+\texttt{ppo\_v4} & Vanilla PPO (v4 shaping) & 500 steps, positive proximity shaping \\
+\texttt{ppo\_icm\_v4} & PPO+ICM (v4 reward) & 500 steps, killed at 88k \\
+\texttt{ppo\_icm\_v7} & PPO+ICM (v4 reward + opts) & sim\_freq=40, camera 128×128 \\
+\bottomrule
+\end{tabular}
+\caption{BinFill training runs. All use \texttt{n\_envs=4}, \texttt{n\_steps=512},
+\texttt{batch\_size=256}, \texttt{lr=3e-4}.}
+\end{table}
+
+\paragraph{Shaped reward (v4).}
+\[
+r_t = 0.05 \cdot \frac{1}{1 + d_t} + r_\text{task}
+\]
+where $d_t$ is TCP-to-cube distance and $r_\text{task}$ includes per-pickup bonuses
+and a terminal success bonus.
+
+\subsection{Training Progression}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llllll}
+\toprule
+\textbf{Run} & \textbf{Steps} & \textbf{Final \texttt{ep\_rew\_mean}} &
+\textbf{Final \texttt{ep\_len\_mean}} & \textbf{Wall-clock} & \textbf{FPS} \\
+\midrule
+\texttt{ppo\_v2}     & 500k & 0.0   & 501 & 4.8 h & 28 \\
+\texttt{ppo\_v3}     & 252k & $-5.1$ & 501 & 2.4 h & 29 \\
+\texttt{ppo\_v4}     & 252k & 10.3  & 501 & 2.4 h & 29 \\
+\texttt{ppo\_icm\_v4} & 88k (killed) & 10.4 & 501 & 1.5 h & 16 \\
+\texttt{ppo\_icm\_v7} & 254k & 11.5 & 501 & 1.0 h & 75 \\
+\bottomrule
+\end{tabular}
+\caption{BinFill training summary. \texttt{ep\_len\_mean = 501} across every run
+indicates no episode ever terminated via success during training; the 500-step
+horizon was always exhausted.}
+\end{table}
+
+\begin{finding}
+\textbf{Key observation.} \texttt{ep\_len\_mean = 501} throughout all BinFill runs.
+The policy is climbing the shaped reward (approach cubes, partial grasps) but
+never closes out a full BinFill episode within the 500-step training horizon.
+The +12\% gap ICM showed during training (10.3 $\to$ 11.5) did not translate
+into any task completion.
+\end{finding}
+
+\subsection{Evaluation Results}
+
+After identifying the 500-step training horizon mismatch, evaluations were run
+at both 500 and 1500 steps (official).
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llccc}
+\toprule
+\textbf{Run} & \textbf{Horizon} & \textbf{Episodes} & \textbf{Success rate} &
+\textbf{Notes} \\
+\midrule
+\texttt{ppo\_v4}     & 500  & 20 & 0.0\% & training-matched \\
+\texttt{ppo\_icm\_v7} & 500 & 20 & 0.0\% & training-matched \\
+\texttt{ppo\_v4}     & 1500 & 20 & \textbf{0.0\%} & official; sim\_freq=100, cam=256 \\
+\texttt{ppo\_icm\_v7} & 1500 & 20 & \textbf{0.0\%} & physics shift vs training \\
+\bottomrule
+\end{tabular}
+\caption{BinFill deterministic eval results, single seed (seed=0).}
+\end{table}
+
+\subsection{Configuration Caveats}
+\label{sec:binfill-caveats}
+
+\begin{enumerate}
+  \item \textbf{Horizon mismatch.} Training at 500 steps; official eval at 1500.
+        Multi-stage tasks may be impossible in 500 steps regardless of policy quality.
+        Fixed in code; not yet retrained.
+  \item \textbf{Physics mismatch (\texttt{ppo\_icm\_v7}).} Trained at
+        \texttt{sim\_freq=40} (40 Hz, 2 substeps/env.step); official is
+        \texttt{sim\_freq=100} (5 substeps). Trained-at-coarse, eval-at-coarse is
+        internally consistent but introduces distribution shift vs official eval.
+        Default removed for future runs.
+  \item \textbf{Camera mismatch (\texttt{ppo\_icm\_v7}).} Trained with cameras at
+        128$\times$128; official renders at 256. Minor distribution shift. Removed
+        for future runs.
+  \item \textbf{Single seed.} Seed=0 only; official requires seeds \{7, 42, 0\} averaged.
+  \item \textbf{Single task.} BinFill is one of 16 benchmark tasks and one of the
+        hardest (cluttered scenes).
+\end{enumerate}
+
+% ============================================================
+\section{PickXtimes Experiments}
+\label{sec:pickxtimes}
+
+\subsection{Common Training Configuration}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Param} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+\texttt{n\_envs} & 4 & SubprocVecEnv \\
+\texttt{n\_steps} & 512 & rollout horizon per env \\
+\texttt{batch\_size} & 256 & PPO minibatch \\
+\texttt{n\_epochs} & 4 & PPO update epochs per rollout \\
+\texttt{lr} & 3e-4 & policy/value optimizer \\
+\texttt{gamma} & 0.997 & high discount for sparse reward \\
+\texttt{target\_kl} & 0.05 & early-stop PPO update \\
+\texttt{ent\_coef} & 0.01 & (varied to 0.001 in one sweep) \\
+\texttt{gae\_lambda} & 0.95 & default \\
+\texttt{max\_steps} & 1500 & matches \texttt{phase1\_eval.py} \\
+\texttt{LSTM hidden} & 256 & 1 shared layer (RecurrentPPO runs) \\
+\texttt{RND output dim} & 128 & 4-layer MLP predictor + target \\
+\bottomrule
+\end{tabular}
+\caption{Common PickXtimes training hyperparameters.}
+\end{table}
+
+\subsection{Reward Variants}
+\label{sec:reward-variants}
+
+All variants share a step penalty $r_\text{step} = -0.01$.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{lccccccc}
+\toprule
+& \textbf{Prox.\ coef} & \textbf{Subgoal bonus} & \textbf{Pickup bonus}
+& \textbf{Grasp hint} & \textbf{Succ.\ terminal} & \textbf{Fail terminal} \\
+\midrule
+\textbf{V1} & 0.05 & +2.0 / subgoal & +1.0 / pick & +0.05 / step & +10 & $-5$ \\
+\textbf{V2} & 0.005 & +10 & +5 & +0.5 & +50 & $-10$ \\
+\textbf{V3} & 0.05 (V1) & +10 (V2) & +5 (V2) & +0.5 (V2) & +50 & $-10$ \\
+\textbf{V4} & \textbf{0} & +10 & +5 & +0.5 & \textbf{+100} & $-10$ \\
+\bottomrule
+\end{tabular}
+\caption{PickXtimes reward variants. V1 is proximity-exploitable; V4 removes
+proximity entirely to force genuine task progress.}
+\end{table}
+
+\paragraph{Proximity reward formula.}
+\[
+r_\text{prox} = \frac{\alpha}{1 + d_t}
+\]
+where $d_t$ is the TCP-to-target-cube distance and $\alpha$ is the
+\emph{Prox.\ coef} from Table~4. In V4, $\alpha = 0$.
+
+\subsection{Experimental Matrix}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{lcccccl}
+\toprule
+\textbf{Run label} & \textbf{Memory} & \textbf{Curiosity} & \textbf{BC warm-start}
+& \textbf{Reward} & \textbf{Seeds} & \textbf{Final SR} \\
+\midrule
+b1 V1 (PPO) & \texttimes & \texttimes & \texttimes & V1 & 1 killed & 0/10 @ 900k \\
+b4 V1 (PPO+RND) & \texttimes & \checkmark & \texttimes & V1 & 1 killed & inferred 0\% \\
+b5 V1 (RecurrentPPO) & \checkmark & \texttimes & \texttimes & V1 & 1 $\to$ 1.34M & 0/20 @ 700k \\
+b6 V1 (Recurrent+RND) & \checkmark & \checkmark & \texttimes & V1 & 3 $\to$ 1.17M & 0/20 @ 900k \\
+b6 V1 + BC & \checkmark & \checkmark & \checkmark & V1 & 3 $\sim$1M & 0/20 @ 600k \\
+b1–b6 V2 (all cells) & all & & \texttimes & V2 & 3 @ $\sim$700k & 0/20 @ 600k \\
+b6 V3 + BC & \checkmark & \checkmark & \checkmark & V3 & 3 @ $\sim$560k & 0/20 @ 500k \\
+b6 V3 + BC + ent=0.001 & \checkmark & \checkmark & \checkmark & V3+low ent & 3 @ $\sim$640k & 0/30 subgoals \\
+V4 + BC + aux=0.5 & \checkmark & \checkmark & \checkmark & V4 & 3 $\to$ 5M & stuck at $-15$ floor \\
+DAgger v1 (4 iters) & (BC retrain) & — & \checkmark & — & 1 & 0/20 pickups \\
+DAgger v2 (8 iters) & (BC retrain) & — & \checkmark & — & 1 & 0/20 through iter 5 \\
+DAPG (bc\_aux=0.05) & \checkmark & \checkmark & \checkmark & V4 & 3 killed @590k & stuck at $-15$ \\
+\bottomrule
+\end{tabular}
+\caption{Full PickXtimes experimental matrix. SR = test-split success rate.
+``Subgoals'' = max subgoal index reached (0 means first pickup never completed).}
+\end{table}
+
+\noindent
+\textbf{Total cluster compute:} ${\approx}33$ RL jobs $\times$ ${\approx}5$h
+$\approx$ \textbf{165 Titan RTX-hours.}
+
+% ============================================================
+\subsection{Phase 1: Initial Reward Sweep (V1, $\sim$1.5M steps)}
+
+\paragraph{Configuration.}
+12 jobs: $\{$b1 PPO, b4 PPO+RND, b5 RecurrentPPO, b6 RecurrentPPO+RND$\}
+\times$ 3 seeds $\times$ V1 reward $\times$ 1.5M steps.
+
+\paragraph{Results.}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Variant} & \textbf{Best train rew.} & \textbf{SR @ 300k}
+& \textbf{SR @ 500k} & \textbf{SR @ 700k} & \textbf{SR @ 900k} \\
+\midrule
+b1 (PPO) & 35.9 & 0/10 & 0/10 & — & 0/10 \\
+b4 (PPO+RND) & 31.4 & 0/10 & — & — & — \\
+b5 (RecurrentPPO) & 46.6 & 0/10 & 0/10 & 0/20 & 0/20 \\
+b6 (RecurrentPPO+RND) & 40.4 & 0/10 & — & — & 0/20 \\
+\bottomrule
+\end{tabular}
+\caption{Phase 1 results. b5 subgoal diagnostic at 900k: 0/20 episodes reach
+even subgoal 1 (first pickup).}
+\end{table}
+
+Training reward climbed smoothly 25 $\to$ 46 over $\sim$900k steps \emph{without
+spikes} — characteristic of proximity-hacking (``hover near object'') rather
+than subgoal completion.
+
+\subsection{Phase 2: Behavior Cloning Pipeline}
+
+\paragraph{Data collection.}
+For each of 80 train-split episodes, \texttt{PandaArmMotionPlanningSolver} was
+instantiated against the env and each subgoal's \texttt{solve(env, planner)}
+callback was executed. \texttt{env.step} was hooked to record
+\texttt{(wrapped\_obs, action)} pairs as per-episode \texttt{.npz} files.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Dataset} & \textbf{Episodes / Transitions} & \textbf{BC loss} \\
+\midrule
+Expert (non-recurrent) & 80 ep, 42{,}821 transitions & 0.006 \\
+Expert (recurrent) & 80 ep, 42{,}821 transitions & 0.007 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{BC training.}
+Same policy class as PPO; MSE between \texttt{policy\_mean} and expert action.
+For the recurrent variant: per-sample LSTM init-zero state (treat each
+transition as memoryless). 30 epochs, batch 256, lr 3e-4.
+
+\paragraph{BC-only evaluation.}
+\begin{itemize}[nosep]
+  \item Test split, deterministic: \textbf{0/20}
+  \item Train split (same episodes used for BC training), deterministic:
+        \textbf{0/20}
+\end{itemize}
+
+Even on the same episodes the BC model was trained on, the BC policy never
+completes the first pickup. Compounding error over 1500 steps puts the policy
+off the expert manifold within $\sim$50 steps.
+
+\subsection{Phase 3: BC Warm-Start Sweep}
+
+The BC-trained \texttt{state\_dict} was loaded into the PPO policy at startup,
+then RL training continued.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Config} & \textbf{Reward} & \textbf{SR @ 600k} \\
+\midrule
+b6 + BC & V1 & 0/20 \\
+b6 + BC & V2 & train reward $\approx -9.6$ (barely above $-10$ floor) \\
+b6 + BC & V3 & 0/20 \\
+b6 + BC + \texttt{ent\_coef=0.001} & V3 & 0/30 (subgoal diagnostic, 3 seeds) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+BC warm-start yielded a +2 training-reward bump (b6+BC $\approx$ 43 vs b6 $\approx$ 41)
+but no improvement in eval SR. Reducing \texttt{ent\_coef} from 0.01 to 0.001
+lowered policy std from 1.02 to 0.83 but produced the same 0/30 subgoal result.
+
+\subsection{Phase 4: V4 Reward + BC + \texttt{bc\_aux\_coef=0.5} (5M steps)}
+
+\paragraph{Design intent.}
+Remove proximity reward entirely ($\alpha = 0$); rely on auxiliary BC loss to
+anchor the policy near the expert mean during RL training.
+
+\paragraph{Configuration.}
+3 seeds $\times$ 5M step target; \texttt{bc\_aux\_coef=0.5} (auxiliary
+\texttt{MSE(policy\_mean, expert\_action)} loss applied after each PPO update
+using a 30k-transition demo subset).
+
+\paragraph{Result.}
+Stuck at training-reward floor of $-15$ (V4's pure step penalty $\times$ 1500)
+for 850k steps before killed. Policy std dropped from 0.37 $\to$ 0.55.
+Zero subgoal completions across all 3 seeds.
+
+\begin{finding}
+\textbf{Root cause.} \texttt{bc\_aux\_coef=0.5} was \textbf{10$\times$ too strong}.
+The auxiliary BC loss pinned the policy to the BC mean (which itself was 0\%
+capable on its own). PPO's policy gradient was effectively suppressed; the run
+degraded to ``what BC alone achieves, maintained by RL.''
+\end{finding}
+
+\subsection{Phase 5: DAgger v1 (4 Iterations, $K=15$)}
+
+\paragraph{Expert-query mechanism.}
+At every $K=15$ env-steps during rollout, the current environment state is
+passed to the motion planner (\texttt{PandaArmMotionPlanningSolver}). The first
+action the planner would take from that state is captured as the expert label.
+
+\begin{codeblock}
+\begin{lstlisting}[language=python]
+def get_first_expert_action(env, planner):
+    # Patch open/close gripper to no-ops (6-step stay-put prelude)
+    planner.open_gripper  = noop_open
+    planner.close_gripper = noop_close
+    def hooked(action, *a, **kw):
+        captured.append(np.clip(action, -1, 1))
+        raise _StopAfterFirstStep()
+    env.step = hooked
+    try:
+        solve_fn(env, planner)   # motion planner runs here
+    except (_StopAfterFirstStep, Exception):
+        pass
+    return captured[0] if captured else None
+\end{lstlisting}
+\end{codeblock}
+
+\paragraph{Bug (iters 1–2).}
+The hook was capturing the first \texttt{env.step} call, but
+\texttt{solve\_pickup} starts with \texttt{planner.open\_gripper(t=6)}, emitting
+6 ``stay-put + gripper-open'' no-op actions before any motion. Iters 1–2
+collected $\sim$4000 no-op transitions (100\% query success on these trivial
+actions), polluting the dataset.
+
+\paragraph{Fix (iters 3–4).}
+Patch \texttt{planner.open\_gripper}/\texttt{close\_gripper} to no-ops before
+invoking \texttt{solve}. Query success dropped to 52–67/100, indicating real
+motion planning.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Iter} & \textbf{Aggregated transitions} & \textbf{Clean fraction} & \textbf{Inline eval} \\
+\midrule
+1 (BC baseline) & 44,821 & — & (eval bug) \\
+2 (polluted) & 46,821 & 0\% extra & (eval bug) \\
+3 (clean) & 48,031 & 4.2\% extra & (eval bug) \\
+4 (clean) & 48,551 & 4.4\% extra & \textbf{0/10 pickups} \\
+Final eval & — & — & \textbf{0/20 pickups, 0/20 drops} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{finding}
+\textbf{Failure mode.} Polluted transitions (40/160 = 25\% of episodes) swamped the
+clean DAgger corrections (only 2,000 / 48,551 = 4\% of final dataset). The dataset
+was too polluted to show improvement.
+\end{finding}
+
+\subsection{Phase 6: DAgger v2 (8 Iterations, $K=5$, Fresh Dataset)}
+
+Fresh aggregated directory (no polluted-data carryover). $K=5$ (3$\times$ more
+expert queries per episode), 8 iters, targeting $\sim$24,000 clean DAgger
+transitions on top of 42,821 BC transitions ($\approx$36\% clean fraction at
+completion).
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Iter} & \textbf{Aggregated transitions} & \textbf{BC retrain loss} & \textbf{Policy SR} \\
+\midrule
+1 & 47,282 & $\sim$0.007 & 0/20 subgoals \\
+2 & 50,667 & $\sim$0.007 & 0/20 subgoals \\
+3 & 53,821 & $\sim$0.007 & 0/20 subgoals \\
+4 & 56,618 & $\sim$0.007 & 0/20 subgoals \\
+5 & 60,308 & $\sim$0.007 & 0/20 subgoals \\
+6–7 & OOM'd (pickle 4-GiB limit) & — & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{finding}
+\textbf{Failure mode.} BC retraining consistently converged to loss $\approx$0.007
+regardless of DAgger iteration. The per-state MSE objective appears fundamentally
+unable to capture trajectory-level success at our model capacity and training
+scale. Even with 25\% clean correction data, the resulting policy cannot complete
+the first pickup. The job was also killed at iter 7 due to a pickle protocol 3
+$\to$ 4 GiB string limit OOM.
+\end{finding}
+
+\subsection{Phase 7: DAPG-Style Enhanced PPO (5M Steps $\times$ 3 Seeds)}
+
+\paragraph{Design.}
+This run attempted to correct every identified failure mode simultaneously:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Element} & \textbf{Setting} \\
+\midrule
+Reward & V4 (no proximity hack) \\
+Memory & RecurrentPPO (LSTM 256) \\
+Curiosity & RND (128-d, running RMS normalization) \\
+BC warm-start & DAgger v2 iter-5 policy \\
+\texttt{init\_log\_std} & $-1.0$ (std = 0.37, tight exploration) \\
+\texttt{bc\_aux\_coef} & \textbf{0.05} (10$\times$ lower than Phase 4) \\
+BC aux dataset & 30k transitions \\
+Step budget & 5M $\times$ 3 seeds (chained A+B jobs) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Result at 590k steps (12\% through).}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Seed} & \textbf{Steps} & \textbf{\texttt{ep\_rew\_mean}} & \textbf{std}
+& \textbf{approx\_kl} & \textbf{value\_loss} \\
+\midrule
+7  & 589k & $-15.0$ (floor) & 0.513 & 0.025 & 0.02 \\
+42 & 588k & $-15.0$ (floor) & 0.512 & 0.025 & 0.02 \\
+0  & 588k & $-15.0$ (floor) & 0.514 & 0.025 & 0.02 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{value\_loss} $\approx$ 0.02 means the value function trivially fits
+the constant $-15$ reward. \texttt{approx\_kl} well below \texttt{target\_kl=0.05}
+— PPO doesn't even early-stop. Std rising 0.37 $\to$ 0.51 — PPO widening
+exploration because it has no signal to commit to.
+
+\begin{finding}
+\textbf{Decision: terminated} at 590k steps.
+Probability of breakthrough at full 5M judged $<$10\% given no signal across
+all 3 seeds at the same point where the Phase~4 run had already shown the same
+flat-floor pattern. Continuing would waste $\sim$75 GPU-hours.
+\end{finding}
+
+% ============================================================
+\section{Diagnosis of Failures}
+\label{sec:diagnosis}
+
+The 7-phase ablation isolates the failure to two co-occurring structural problems
+that cannot be fixed by reward / memory / curiosity / BC tweaks at the scales tested:
+
+\subsection{F1 — Proximity Shaping is Reward-Hackable}
+
+V1's $0.05/(1+d)$ per-step term pays up to $\sim$50–70 over a 1500-step episode
+for pure ``hover near object'' behavior, dwarfing the +14 subgoal + +10 terminal
+bonuses. Training reward climbed smoothly without spikes. Diagnostic: 0/20
+episodes reach subgoal 1 at 900k steps despite training reward of 46.
+
+\subsection{F2 — Removing Proximity Removes the Only Exploration Gradient}
+
+V2 attenuated proximity 10$\times$ and boosted task bonuses 5$\times$. With no
+gradient to guide the policy toward cubes, random exploration in 8-D continuous
+action space (std $\approx$ 1) never produces a coordinated grasp sequence.
+Training reward stayed at floor ($-10$) for the full 1.1M steps tested.
+
+\subsection{F3 — BC Compounding Errors over 1500 Steps}
+
+BC loss converges to 0.006 (excellent per-state fitting) but the resulting
+policy fails 100\% even on TRAIN-split episodes. Per-state MSE cannot prevent
+trajectory-level compounding errors over 1500 steps; the policy drifts off the
+expert manifold within $\sim$50 steps and never recovers.
+
+\subsection{F4 — RND Curiosity Solves the Wrong Exploration Problem}
+
+RND rewards visiting novel CNN-extractor feature states. Our exploration
+challenge is ``execute precise gripper close at the right height.'' RND has no
+signal for fine motor precision. RND on top of RecurrentPPO underperformed
+RecurrentPPO alone in every run (b6: 40 vs b5: 46 at 600k).
+
+\subsection{F5 — LSTM Memory Helps Training Reward but Not Eval}
+
+RecurrentPPO reaches training reward 46 vs vanilla PPO 36. LSTM clearly aids
+tracking the target across the episode. However, memory has no job on subgoal 0
+(which the policy never passes); counting picks never matters.
+
+\subsection{F6 — High Exploration Noise Drowns Out BC Warm-Start}
+
+With default \texttt{init\_log\_std=0} (std=1.0), the BC-loaded policy's near-expert
+mean is immediately dominated by Gaussian noise. The first sampled action deviates
+from BC mean by $\sim\sigma$ per dimension — far too much for the fine-grained
+grasp configuration.
+
+\subsection{F7 — Auxiliary BC Loss Magnitude is Fragile}
+
+\texttt{bc\_aux\_coef=0.5} (Phase 4) pinned the policy to BC mean (which itself was
+0\% capable), suppressing PPO's gradient. The run stayed at $-15$ floor for 850k
+steps. \texttt{bc\_aux\_coef=0.05} (Phase 7) is 10$\times$ lower but still
+insufficient — PPO still has no positive signal to commit to in V4.
+
+\subsection{F8 — DAgger Bottlenecked by BC Retraining Objective}
+
+Both DAgger v1 (polluted) and v2 (clean) produce 0\% policy success at each
+iteration. BC loss converges to 0.007 — virtually identical to plain BC.
+The per-state MSE objective fundamentally cannot capture trajectory-level success
+at our policy class and training scale.
+
+% ============================================================
+\section{Summary Across All Experiments}
+\label{sec:summary}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{clll}
+\toprule
+\textbf{Phase} & \textbf{Approach} & \textbf{Best result} & \textbf{Status} \\
+\midrule
+BinFill & PPO + PPO+ICM, 250k steps & 0/20 SR (both) & done \\
+\midrule
+1 & V1 sweep (4 cells $\times$ 3 seeds $\times$ 1.5M) & 0/20 SR; max\_subgoal=0 & done \\
+2 & BC pipeline (80 expert ep, loss 0.006) & 0/20 train AND test & done \\
+3 & BC warm-start (V1/V2/V3) & 0/20 & done \\
+4 & V4 + BC + aux=0.5 + low-std (5M target) & stuck at $-15$ floor & killed @850k \\
+5 & DAgger v1 (4 iters, $K$=15) & 0/20 (polluted dataset) & done \\
+6 & DAgger v2 (8 iters, $K$=5, fresh) & 0/20 through iter 5 & killed @iter 6 \\
+7 & DAPG (5M $\times$ 3 seeds, all fixes) & stuck at $-15$ floor @590k & killed \\
+\bottomrule
+\end{tabular}
+\caption{All experiments. Headline: \textbf{0\% eval SR} across every phase,
+every baseline cell, every seed.}
+\end{table}
+
+\begin{finding}
+\textbf{Bottom-line conclusion.}
+Enhanced PPO with memory (LSTM) + curiosity (RND) + behavior cloning + DAgger
++ demo-augmented loss collapses to 0\% on PickXtimes within our 5M-step compute
+budget ($\sim$165 Titan RTX-hours). This replicates the MIKASA-Robo (ICLR 2025)
+finding that PPO/PPO-LSTM collapses on hard sparse-reward long-horizon manipulation
+at standard scales.
+\end{finding}
+
+% ============================================================
+\section{Engineering Fixes (Kept in Code)}
+\label{sec:engineering}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{p{4.5cm}p{5cm}p{4cm}}
+\toprule
+\textbf{Issue} & \textbf{Fix} & \textbf{File} \\
+\midrule
+SAPIEN 3.0.3 + torch 2.9 GPU sim typestr error
+& Force \texttt{ROBOMME\_SIM\_BACKEND=physx\_cpu} in all sbatch
+& all \texttt{scripts/cluster/*.sbatch} \\
+\addlinespace
+Eval-time action clip (unbounded recurrent Gaussian $\to$ OOD env step)
+& \texttt{np.clip(action, -1, 1)} before \texttt{env.step}
+& \texttt{train/evaluate\_trained.py}, \texttt{scripts/eval\_*.py} \\
+\addlinespace
+Cluster slurm log dir wiped by rsync \texttt{-{}-delete}
+& \texttt{-{}-exclude='logs/'} in sync script
+& \texttt{scripts/cluster/sync\_to\_cluster.sh} \\
+\addlinespace
+BC \texttt{state\_dict} saved on GPU $\to$ load failure
+& Save on CPU via \texttt{\{k: v.cpu() for k, v in ...\}}
+& \texttt{scripts/bc\_pretrain\_pickxtimes.py} \\
+\addlinespace
+BC dataset OOM at 32G slurm allocation
+& Stream per-episode to \texttt{.npz}; load slice on demand
+& \texttt{scripts/collect\_bc\_pickxtimes.py} \\
+\addlinespace
+DAgger query captured ``stay-put + open-gripper'' no-ops
+& Patch \texttt{planner.open/close\_gripper} to no-ops before \texttt{solve}
+& \texttt{scripts/dagger\_iter.py:\allowbreak get\_first\_expert\_action} \\
+\addlinespace
+\texttt{eval\_subgoal} failed to load BC \texttt{.pt} state\_dicts
+& Auto-detect \texttt{.pt} vs \texttt{.zip}; fresh model + \texttt{load\_state\_dict}
+& \texttt{scripts/eval\_subgoal.py} \\
+\bottomrule
+\end{tabular}
+\caption{Engineering fixes shipped and kept in the codebase.}
+\end{table}
+
+% ============================================================
+\section{New Code Shipped}
+\label{sec:code}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Category} & \textbf{Files} \\
+\midrule
+Reward shaping (4 variants)
+& \texttt{train/rewards/pickxtimes\{,\_v2,\_v3,\_v4\}.py} \\
+RND module
+& \texttt{train/models/rnd.py} \\
+PPO+RND algo
+& \texttt{train/algos/ppo\_with\_rnd.py} \\
+RecurrentPPO+RND+BC-aux algo
+& \texttt{train/algos/recurrent\_ppo\_with\_rnd.py} \\
+Trainers (3 new)
+& \texttt{train/train\_ppo\_rnd.py}, \texttt{train\_ppo\_recurrent.py},
+  \texttt{train\_ppo\_recurrent\_rnd.py} \\
+BC pipeline
+& \texttt{scripts/collect\_bc\_pickxtimes.py},
+  \texttt{scripts/bc\_pretrain\_pickxtimes.py} \\
+DAgger pipeline
+& \texttt{scripts/dagger\_iter.py} \\
+Diagnostic evals
+& \texttt{scripts/eval\_\{subgoal,stochastic,bc\_only,bc\_only\_train\}.py} \\
+Aggregation
+& \texttt{scripts/aggregate\_pickxtimes\_results.py} \\
+Cluster sweep submitters
+& \texttt{scripts/cluster/submit\_\{pickxtimes\_sweep,pickxtimes\_v2,}\\
+& \quad\texttt{bc\_warmstart\_sweep,b6\_bc\_v2,b6\_bc\_v3,}\\
+& \quad\texttt{b6\_bc\_v3\_lowent,5m\_bc\_v4,5m\_bc\_v4\_chain,dapg\_5m\}.sh} \\
+Eval extensions
+& \texttt{train/evaluate\_trained.py} (recurrent path + action-clip fix) \\
+\bottomrule
+\end{tabular}
+\caption{New files added ($\approx$2{,}500 LOC total).}
+\end{table}
+
+% ============================================================
+\section{Recommendations for Next Steps}
+\label{sec:nextsteps}
+
+In decreasing order of expected impact based on what the ablation has isolated:
+
+\subsection{Strongest Option: Offline RL (IQL / CQL)}
+
+\textbf{Why:} bypasses exploration entirely. A teammate's IQL result on this same
+task is reported as non-zero, confirming the 42,821-transition BC dataset itself
+is sufficient --- the bottleneck is the online RL paradigm, not data quality.
+
+\begin{itemize}[nosep]
+  \item The BC dataset is already collected and on disk at 5.9 GB
+        (\texttt{scripts/collect\_bc\_pickxtimes.py} output).
+  \item IQL (Kostrikov et al., 2021) or CQL (Kumar et al., 2020) train a
+        $Q$-function entirely from offline demonstrations; policy extraction via
+        advantage-weighted regression is more robust to compounding errors
+        than BC's per-state MSE.
+  \item \textbf{Implementation note}: the existing CNN extractor + policy class
+        can be reused; only the training loop changes.
+\end{itemize}
+
+\subsection{Action Chunking (ACT-Style)}
+
+Predicting $K=8$ actions at once reduces the effective horizon from 1500 to
+$\approx$187 steps. This approach has been combined with PPO in recent manipulation
+papers and addresses both F2 (exploration) and F3 (compounding errors) simultaneously.
+
+\subsection{Hierarchical Action Space}
+
+Expose planner primitives (reach, grasp, lift, drop, button-press) as the action
+space; RL learns a meta-controller. Exploration drops from ``find a coordinated
+8-D sequence over 1500 steps'' to ``pick the right one of 5 primitives at
+$\sim$5 decision points.'' The motion planner (\texttt{PandaArmMotionPlanningSolver})
+is already in the codebase and used for BC data collection.
+
+\subsection{DAgger at Much Greater Scale}
+
+DAgger v2 (8 iters) suggests BC retraining is the bottleneck — not the
+expert-query mechanism itself. Running 50+ iterations with $K=2$ might
+overcome it. Requires fixing the OOM issue (switch from pickle to HDF5 or
+\texttt{zarr} for the aggregated dataset to avoid the 4-GiB pickle protocol 3
+string limit).
+
+\subsection{Reward V5 — Expert-Trajectory Distance}
+
+Use the BC dataset as a reference set. Per-step reward $= -\min_{(s^*, a^*)}
+\|s_t - s^*\|$ provides a dense gradient toward the expert manifold without
+the proximity-hack failure mode (signal is ``be on expert trajectory,'' not
+``be near object'').
+
+\subsection{5–25M Training Steps}
+
+MIKASA-Robo's positive results used 5–25M steps. Any of the above approaches
+may still require this budget.
+
+\subsection{Curriculum}
+
+Train exclusively on \texttt{seed \% 3 == 0} (easy, $N=1$ cycle only) until
+the first success, then add medium and hard. Reduces the sparse-reward
+exploration problem by $\sim$3$\times$.
+
+\subsection{What Is Explicitly Not Worth Trying}
+
+\begin{itemize}[nosep]
+  \item More ICM / RND / RIDE permutations on top of existing RecurrentPPO
+        (already tested all combinations; memory and curiosity both fail).
+  \item Additional reward variants V5–VN with any proximity term (all proximity
+        formulations are exploitable at long horizons).
+  \item BC warm-start alone without changing the RL loss structure (phases 3–7
+        show it provides no eval SR improvement).
+  \item Multi-task RL training (open research problem, out of scope).
+\end{itemize}
+
+% ============================================================
+\section{Cluster Replication Notes}
+\label{sec:replication}
+
+\begin{enumerate}
+  \item \textbf{Always export} \texttt{ROBOMME\_SIM\_BACKEND=physx\_cpu} before
+        any training or eval script. GPU sim crashes on SAPIEN 3.0.2 + torch 2.9.
+
+  \item \textbf{Action clipping}: eval scripts must call
+        \texttt{np.clip(action, -1, 1)} before \texttt{env.step}.
+        RecurrentPPO uses an unbounded Gaussian policy; without clipping, the
+        deterministic-eval mean can step OOD joint targets.
+
+  \item \textbf{rsync}: always include \texttt{-{}-exclude='logs/'} when syncing
+        to cluster with \texttt{-{}-delete}. The \texttt{logs/} directory
+        contains slurm output; deleting it causes exit-120 startup failures.
+
+  \item \textbf{BC dataset streaming}: load the BC dataset per-episode from
+        \texttt{.npz} files, not all-at-once. Full dataset is 5.9 GB; loading
+        into RAM exceeds 32 GB slurm allocations.
+
+  \item \textbf{Conda env}: \texttt{/vision/u/jevon/miniconda3/envs/robomme/}
+        on the Stanford cluster. Contains all pinned versions in the table above.
+\end{enumerate}
+
+% ============================================================
+\appendix
+
+\section{File Pointers}
+\label{app:files}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Artifact} & \textbf{Path} \\
+\midrule
+BinFill eval report & \texttt{runs/eval\_results/REPORT.md} \\
+PickXtimes findings & \texttt{runs/eval\_results/PICKXTIMES\_REPORT.md} \\
+Full experiment log & \texttt{runs/eval\_results/EXPERIMENT\_LOG.md} \\
+Next-steps plan & \texttt{runs/eval\_results/NEXT\_STEPS.md} \\
+BinFill eval JSON & \texttt{runs/eval\_results/ppo\_v4\_BinFill\_official.json} \\
+Training logs & \texttt{runs/<run>/train.log} \\
+BC dataset & \texttt{data/bc\_pickxtimes/} (on cluster; 5.9 GB) \\
+DAgger v2 dataset & \texttt{data/dagger\_v2/} (on cluster; iters 1–5) \\
+Cluster conda env & \texttt{/vision/u/jevon/miniconda3/envs/robomme/} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Reward Function Code Sketches}
+
+\paragraph{V1 (proximity-exploitable).}
+
+\begin{lstlisting}[language=python]
+def compute_reward(obs, info):
+    d = tcp_to_cube_distance(obs)
+    r_prox  = 0.05 / (1 + d)       # exploitable: agent hovers near cube
+    r_grasp = 0.05 * is_grasping(info)
+    r_sub   = 2.0 * subgoal_advance(info)
+    r_pick  = 1.0 * pickup_detected(info)
+    r_term  = +10 if info["success"] else (-5 if info["fail"] else 0)
+    return r_prox + r_grasp + r_sub + r_pick + r_term - 0.01
+\end{lstlisting}
+
+\paragraph{V4 (no proximity, pure task signal).}
+
+\begin{lstlisting}[language=python]
+def compute_reward(obs, info):
+    # alpha = 0: no proximity term
+    r_grasp = 0.5 * is_grasping(info)
+    r_sub   = 10.0 * subgoal_advance(info)
+    r_pick  = 5.0  * pickup_detected(info)
+    r_term  = +100 if info["success"] else (-10 if info["fail"] else 0)
+    return r_grasp + r_sub + r_pick + r_term - 0.01
+\end{lstlisting}
+
+\end{document}

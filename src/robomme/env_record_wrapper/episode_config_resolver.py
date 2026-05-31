@@ -215,8 +215,13 @@ class BenchmarkEnvBuilder:
                 _gpu = torch.cuda.is_available()
                 _sim_backend = _sim_backend or ("physx_cuda" if _gpu else "physx_cpu")
                 _render_backend = _render_backend or ("gpu" if _gpu else "cpu")
+        # ROBOMME_OBS_MODE lets the RL training path drop the depth and
+        # segmentation render passes (set to "rgb"). SAPIEN does ~2x the
+        # per-step GPU rendering work for the full "rgb+depth+segmentation"
+        # mode; video recording wrappers still want the full mode.
+        _obs_mode = os.environ.get("ROBOMME_OBS_MODE", "rgb+depth+segmentation")
         env_kwargs = dict(
-            obs_mode="rgb+depth+segmentation",
+            obs_mode=_obs_mode,
             control_mode="pd_joint_pos",
             render_mode=self.render_mode,
             # Default to "sparse" because every task's compute_dense_reward is a
@@ -229,6 +234,31 @@ class BenchmarkEnvBuilder:
             sim_backend=_sim_backend,
             render_backend=_render_backend,
         )
+        # ROBOMME_CAMERA_RES sets a global width/height override for every camera
+        # in the env. Tasks ship 256x256 base + 256x256 wrist cameras; the RL
+        # wrapper resizes both down to 128x128 with cv2 anyway, so rendering at
+        # 256 then resizing is ~4x wasted GPU work per camera. Recording paths
+        # that want full-res should leave this unset.
+        _cam_res = os.environ.get("ROBOMME_CAMERA_RES")
+        if _cam_res:
+            try:
+                _res = int(_cam_res)
+                env_kwargs["sensor_configs"] = dict(width=_res, height=_res)
+            except ValueError:
+                logger.warning(f"Ignoring invalid ROBOMME_CAMERA_RES={_cam_res!r}")
+
+        # ROBOMME_SIM_FREQ overrides the physics simulation rate (Hz). Default
+        # SimConfig uses sim_freq=100 / control_freq=20 → 5 physx substeps per
+        # env.step. With physx_cpu running on multi-threaded SAPIEN, those
+        # substeps dominate the CPU budget; lowering sim_freq to 50 halves
+        # per-step CPU work and is fine for tasks like BinFill where contact
+        # dynamics don't require fine timesteps. control_freq stays at 20.
+        _sim_freq = os.environ.get("ROBOMME_SIM_FREQ")
+        if _sim_freq:
+            try:
+                env_kwargs["sim_config"] = dict(sim_freq=int(_sim_freq))
+            except ValueError:
+                logger.warning(f"Ignoring invalid ROBOMME_SIM_FREQ={_sim_freq!r}")
         if seed is not None:
             env_kwargs["seed"] = seed
         if difficulty_hint:
