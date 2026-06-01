@@ -119,13 +119,20 @@ def parse_args():
     ap.add_argument("--output_dir", default=None)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--allow-gym-fallback", dest="allow_gym_fallback", action="store_true", default=None)
+    ap.add_argument(
+        "--bc_checkpoint", default=None,
+        help="Path to a BC-pretrained .zip to warm-start the PPO policy weights",
+    )
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
     cfg = load_yaml(args.config)
-    overrides = {k: v for k, v in vars(args).items() if k not in ("config", "tag") and v is not None}
+    overrides = {
+        k: v for k, v in vars(args).items()
+        if k not in ("config", "tag", "bc_checkpoint") and v is not None
+    }
     cfg = merge_overrides(cfg, overrides)
 
     PPO, CheckpointCallback, EvalCallback, Monitor, DummyVecEnv, SubprocVecEnv = _require_sb3()
@@ -182,8 +189,20 @@ def main():
         tensorboard_log=str(run_dir / "tb"),
         seed=cfg["seed"],
         device=cfg.get("device", "auto"),
+        policy_kwargs=cfg.get("policy_kwargs") or {},
         verbose=1,
     )
+
+    bc_checkpoint = args.bc_checkpoint or cfg.get("bc_checkpoint")
+    if bc_checkpoint:
+        bc_path = Path(bc_checkpoint)
+        if not bc_path.exists():
+            raise FileNotFoundError(f"BC checkpoint not found: {bc_path}")
+        print(f"[train_ppo] warm-starting policy from BC checkpoint: {bc_path}")
+        bc_model = PPO.load(str(bc_path), device=cfg.get("device", "auto"))
+        model.policy.load_state_dict(bc_model.policy.state_dict())
+        del bc_model
+        print("[train_ppo] BC policy weights loaded")
 
     wandb_run = None
     if os.environ.get("WANDB_API_KEY"):

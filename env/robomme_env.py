@@ -139,7 +139,8 @@ class _FlattenLatestObs:
     def space(self, sample_obs: Dict[str, Any]) -> spaces.Box:
         v = self._vec(sample_obs)
         self._dim = v.shape[0]
-        return spaces.Box(low=-np.inf, high=np.inf, shape=(v.shape[0],), dtype=np.float32)
+        # SB3 2.3+ requires finite observation space bounds for on-policy algorithms.
+        return spaces.Box(low=-10.0, high=10.0, shape=(v.shape[0],), dtype=np.float32)
 
 
 _ACTION_DIMS = {
@@ -152,7 +153,8 @@ _ACTION_DIMS = {
 def _action_space_for(name: str) -> spaces.Space:
     if name in _ACTION_DIMS:
         d = _ACTION_DIMS[name]
-        return spaces.Box(low=-np.inf, high=np.inf, shape=(d,), dtype=np.float32)
+        # SB3 2.3+ requires finite bounds; joint angles stay well within [-10, 10] rad.
+        return spaces.Box(low=-10.0, high=10.0, shape=(d,), dtype=np.float32)
     raise ValueError(
         f"action_space '{name}' is not supported by the Gym-compatible wrapper "
         f"(supported: {sorted(_ACTION_DIMS)}). For multi_choice use the raw env."
