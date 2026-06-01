@@ -1,36 +1,69 @@
-task_name: PickXtimes
+task_name: BinFill
 seed: 0
-total_timesteps: 100000
+total_timesteps: 10000000  # 10 M steps — minimum viable budget for manipulation with intrinsic reward
 
-# RoboMME-specific env knobs (forwarded to BenchmarkEnvBuilder /
-# make_env_for_episode). See doc/env_format.md in the robomme repo.
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+# flatten_keys selects the three numeric state streams (obs_dim = 15).
+# Image streams are ignored to avoid expensive pixel processing.
 env_kwargs:
-  dataset: train          # train | val | test
-  action_space: joint_angle  # joint_angle | ee_pose | waypoint
-  max_steps: 300
-  episode_idx: null       # null = cycle through episodes on each reset
-  flatten_obs: true       # take latest frame, concat numeric state -> Box obs
-  episode_kwargs: {}      # include_* flags for make_env_for_episode
+  dataset: train
+  action_space: joint_angle
+  max_steps: 600            # BinFill sub-task count is variable (2×total_cubes+1, up to ~13 tasks);
+                            # each task needs ~30-50 steps → up to ~650 steps worst case; 600 is a
+                            # reasonable budget that covers most episodes without padding too much
+  episode_idx: null
+  flatten_obs: true
+  flatten_keys:
+    - eef_state_list        # (6,)  end-effector pos + rpy
+    - joint_state_list      # (7,)  joint positions
+    - gripper_state_list    # (2,)  gripper state
+  episode_kwargs: {}
+  subtask_reward: 1.0       # +1 per sub-task completed (0.0 to disable)
+  step_penalty: 0.005       # subtracted every non-terminal step; kept small so completing at max_steps
+                            # still beats failing: e.g. 7-task BinFill: 8.0 reward − 600×0.005 = +5.0
 
-learning_rate: 3.0e-4
-n_steps: 2048
-batch_size: 64
-n_epochs: 10
-gamma: 0.99
-gae_lambda: 0.95
-clip_range: 0.2
-ent_coef: 0.0
-vf_coef: 0.5
-max_grad_norm: 0.5
+# ---------------------------------------------------------------------------
+# PPO hyperparameters
+# ---------------------------------------------------------------------------
+# Rollout buffer per update: n_envs × n_steps = 16 × 512 = 8 192 transitions.
+# batch_size must divide that total exactly; train_ppo.py auto-adjusts if not.
+# 8 192 / 1 024 = 8 minibatches × 8 epochs = 64 gradient steps per update.
+learning_rate: 3.0e-4       # Adam LR; 3e-4 is the standard PPO starting point
+n_steps: 512                # steps collected per env per update
+batch_size: 1024            # must divide n_envs × n_steps (16 × 512 = 8 192); gives 8 minibatches
+n_epochs: 8                 # PPO reuse epochs per rollout; 4 is conservative (safe from high KL);
+                            # can raise to 8-10 if approx_kl stays below 0.02
+gamma: 0.99                 # discount; effective horizon ≈ 1/(1-γ) = 100 steps, fine for max_steps=600
+gae_lambda: 0.95            # GAE λ; high bias–variance trade-off standard
+clip_range: 0.2             # PPO clip ε; standard starting point; reduce to 0.1 if unstable
+ent_coef: 0.02              # entropy bonus; raised from 0.01 — manipulation with sparse reward
+                            # needs more exploration pressure to avoid premature convergence
+vf_coef: 0.5                # value loss weight; standard
+max_grad_norm: 0.5          # gradient clipping; standard for PPO
 
-eval_interval: 10000
-eval_episodes: 5
-checkpoint_interval: 25000
+# ---------------------------------------------------------------------------
+# Evaluation and checkpointing
+# ---------------------------------------------------------------------------
+eval_interval: 200000       # every 200 k env steps ≈ 49 PPO update cycles
+eval_episodes: 20           # episodes per eval; 20 gives ±SE ~0.11 for a 0.5 success rate
+checkpoint_interval: 1000000
 
-n_envs: 1
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+# n_envs: tuned for a GPU VM (ManiSkill/SAPIEN uses GPU for physics).
+# GPU parallelism allows more envs than CPU-only; VRAM is the main constraint.
+# Rule of thumb for ManiSkill on a single GPU:
+#   8 GB  VRAM  →  n_envs: 8–16
+#   16 GB VRAM  →  n_envs: 16–32   (default below assumes ~16 GB)
+#   40 GB VRAM  →  n_envs: 32–64
+# batch_size must divide n_envs × n_steps; train_ppo.py auto-adjusts if not.
+n_envs: 16
 allow_gym_fallback: false
 deterministic_torch: false
 
 output_dir: logs
 policy: MlpPolicy
-device: cpu
+device: auto                # SB3 picks CUDA if available, else CPU

@@ -176,6 +176,8 @@ class RoboMMEEnv(gym.Env):
         flatten_keys: Sequence[str] = _DEFAULT_FLATTEN_KEYS,
         builder_kwargs: Optional[Dict[str, Any]] = None,
         episode_kwargs: Optional[Dict[str, Any]] = None,
+        subtask_reward: float = 0.0,
+        step_penalty: float = 0.0,
     ):
         super().__init__()
         self.task_name = task_name
@@ -192,6 +194,9 @@ class RoboMMEEnv(gym.Env):
         self._inner = None
         self._builder = None
         self._episode_num: Optional[int] = None
+        self._subtask_reward = float(subtask_reward)
+        self._step_penalty = float(step_penalty)
+        self._prev_task_index: int = 0
         self._backend, self._builder, _gym_env = self._init_backend(allow_gym_fallback)
 
         if self._backend == "gymnasium-fallback":
@@ -283,6 +288,7 @@ class RoboMMEEnv(gym.Env):
         return obs
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        self._prev_task_index = 0
         if self._backend == "robomme":
             ep = self._select_episode(seed)
             self._inner = self._open_new_episode(ep)
@@ -292,12 +298,47 @@ class RoboMMEEnv(gym.Env):
             return self._post(obs), info
         return self._inner.reset(seed=seed, options=options)
 
+    def _get_task_index(self) -> Optional[int]:
+        """Read current_task_index from the underlying task env (set by sequential_task_check)."""
+        base = getattr(self._inner, "unwrapped", self._inner)
+        idx = getattr(base, "current_task_index", None)
+        if idx is None:
+            idx = getattr(base, "timestep", None)
+        try:
+            return int(idx) if idx is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self._inner.step(action)
         if self._backend == "robomme":
-            reward = float(np.asarray(reward).item() if hasattr(reward, "item") else reward or 0.0)
+            # Use explicit None check — `reward or 0.0` would silently zero small negatives.
+            raw = reward.item() if hasattr(reward, "item") else reward
+            reward = float(raw if raw is not None else 0.0)
             terminated = bool(np.asarray(terminated).item() if hasattr(terminated, "item") else terminated)
             truncated = bool(np.asarray(truncated).item() if hasattr(truncated, "item") else truncated)
+            # RoboMME zeroes reward intentionally (IL benchmark). Emit +1 on success
+            # using info["success"] (a torch.Tensor) which is always populated by the env.
+            success_val = info.get("success") if isinstance(info, dict) else None
+            if success_val is not None:
+                try:
+                    if bool(success_val.item() if hasattr(success_val, "item") else success_val):
+                        reward = 1.0
+                except Exception:
+                    pass
+            # Emit subtask_reward for each sub-task the agent completes within an episode.
+            # current_task_index (set by sequential_task_check) increments each time one
+            # entry in task_list is satisfied; rewarding its advance gives a dense signal
+            # without waiting for full episode success.
+            if self._subtask_reward > 0.0:
+                curr_idx = self._get_task_index()
+                if curr_idx is not None and curr_idx > self._prev_task_index:
+                    reward += self._subtask_reward * (curr_idx - self._prev_task_index)
+                    self._prev_task_index = curr_idx
+            # Penalise every non-terminal step to encourage shorter solutions.
+            # Applied last so the success/subtask bonuses are not eroded on the winning step.
+            if self._step_penalty > 0.0 and not (terminated or truncated):
+                reward -= self._step_penalty
         return self._post(obs), reward, terminated, truncated, info
 
     def render(self):
