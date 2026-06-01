@@ -229,7 +229,8 @@ class RoboMMEEnv(gym.Env):
                 env_id=self.task_name,
                 dataset=self._dataset,
                 action_space=self._action_space_name,
-                gui_render=(self._render_mode == "human"),
+                # gui_render=(self._render_mode == "human"),
+                gui_render=False,
                 max_steps=self._max_steps,
                 **self._builder_kwargs,
             )

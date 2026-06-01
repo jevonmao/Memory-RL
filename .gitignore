@@ -19,6 +19,7 @@ wandb/
 *.ckpt
 *.npz
 results/
+data/data/robomme_data_h5
 
 # OS / editor
 .DS_Store

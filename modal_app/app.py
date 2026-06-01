@@ -40,6 +40,103 @@ import modal
 # ---------------------------------------------------------------------------
 ROBOMME_REV = "07be6fbc66350ddca200abfb0a11b692f078f7fd"
 
+# image = (
+#     modal.Image.from_registry(
+#         "nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04",
+#         add_python="3.11",
+#     )
+#     .apt_install(
+#         "build-essential",
+#         "clang",  # toppra (mani-skill dep) hardcodes clang for its Cython ext.
+#         "ca-certificates",
+#         "curl",
+#         "ffmpeg",
+#         "git",
+#         "libegl1",
+#         "libgl1",
+#         "libglib2.0-0",
+#         "libvulkan1",
+#         "vulkan-tools",
+#         "libxext6",
+#         "libxrender1",
+#     )
+#     .pip_install(
+#         # Pinned per RoboMME pyproject — these versions are picked to be
+#         # mutually compatible with mani-skill 3.0.0b21.
+#         "torch==2.9.1",
+#         "torchvision==0.24.1",
+#         f"mani-skill @ git+https://github.com/YinpeiDai/ManiSkill.git@{ROBOMME_REV}",
+#         "h5py",
+#         "opencv-python>=4.11.0.86",
+#         "stable-baselines3==2.8.0",
+#         "tensorboard",
+#         "pyyaml",
+#         "wandb>=0.18",
+#     )
+#     .env(
+#         {
+#             "NVIDIA_DRIVER_CAPABILITIES": "compute,graphics,utility,video",
+#             "SAPIEN_RENDER_DEVICE": "cuda",
+#             "PYTHONUNBUFFERED": "1",
+#             "WANDB_PROJECT": "memory-rl",
+#         }
+#     )
+# )
+
+# image = (
+#     modal.Image.from_registry(
+#         "nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04",
+#         add_python="3.11",
+#     )
+#     .apt_install(
+#         "build-essential",
+#         "clang",
+#         "ca-certificates",
+#         "curl",
+#         "ffmpeg",
+#         "git",
+#         "libegl1",
+#         "libgl1",
+#         "libglib2.0-0",
+#         "libvulkan1",
+#         "libvulkan-dev",
+#         "mesa-vulkan-drivers",
+#         "vulkan-tools",
+#         "vulkan-validationlayers",
+#         "libxext6",
+#         "libxrender1",
+#     )
+#     .pip_install(
+#         "torch==2.9.1",
+#         "torchvision==0.24.1",
+#         f"mani-skill @ git+https://github.com/YinpeiDai/ManiSkill.git@{ROBOMME_REV}",
+#         "h5py",
+#         "opencv-python>=4.11.0.86",
+#         "stable-baselines3==2.8.0",
+#         "tensorboard",
+#         "pyyaml",
+#         "wandb>=0.18",
+#     )
+#     .env(
+#     {
+#         "NVIDIA_DRIVER_CAPABILITIES": "all",
+#         "NVIDIA_VISIBLE_DEVICES": "all",
+
+#         # Vulkan / EGL
+#         "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/nvidia_icd.json",
+#         "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
+
+#         # SAPIEN / ManiSkill
+#         "SAPIEN_RENDER_DEVICE": "cuda",
+#         "MUJOCO_GL": "egl",
+#         "PYOPENGL_PLATFORM": "egl",
+
+#         "PYTHONUNBUFFERED": "1",
+#         "WANDB_PROJECT": "memory-rl",
+#     }
+# )
+# )
+
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04",
@@ -47,44 +144,51 @@ image = (
     )
     .apt_install(
         "build-essential",
-        "clang",  # toppra (mani-skill dep) hardcodes clang for its Cython ext.
+        "clang",
         "ca-certificates",
         "curl",
         "ffmpeg",
         "git",
+
+        # OpenGL / headless rendering
         "libegl1",
         "libgl1",
         "libglib2.0-0",
-        "libvulkan1",
-        "vulkan-tools",
+        "libosmesa6",
+        "libosmesa6-dev",
+
+        # useful X/GL deps
         "libxext6",
         "libxrender1",
     )
     .pip_install(
-        # Pinned per RoboMME pyproject — these versions are picked to be
-        # mutually compatible with mani-skill 3.0.0b21.
+        # RoboMME / ManiSkill pinned versions
         "torch==2.9.1",
         "torchvision==0.24.1",
         f"mani-skill @ git+https://github.com/YinpeiDai/ManiSkill.git@{ROBOMME_REV}",
-        "h5py",
-        "opencv-python>=4.11.0.86",
+
+        # RL stack
         "stable-baselines3==2.8.0",
         "tensorboard",
+
+        # utilities
+        "h5py",
+        "opencv-python>=4.11.0.86",
         "pyyaml",
         "wandb>=0.18",
     )
     .env(
         {
-            "NVIDIA_DRIVER_CAPABILITIES": "compute,graphics,utility,video",
-            "SAPIEN_RENDER_DEVICE": "cuda",
-            "PYTHONUNBUFFERED": "1",
-            "WANDB_PROJECT": "memory-rl",
+            "SAPIEN_RENDER_DEVICE": "cpu",
+            "MUJOCO_GL": "osmesa",
+            "PYOPENGL_PLATFORM": "osmesa",
         }
     )
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ROBOMME_SRC = Path("/home/jevon/projects/robomme_benchmark")
+# ROBOMME_SRC = Path("/home/jevon/projects/robomme_benchmark")
+ROBOMME_SRC = REPO_ROOT / "robomme_benchmark"
 
 # Modal 1.x: bake source dirs into the image (rebuild-free across runs because
 # Modal hashes contents — only changed files trigger a layer rebuild).
@@ -94,6 +198,7 @@ image = image.add_local_dir(str(ROBOMME_SRC), remote_path="/robomme_src")
 app = modal.App("memory-rl")
 
 GPU = "A10G"  # cheapest GPU on Modal that comfortably runs SAPIEN; bump to A100 for big sweeps.
+# GPU = modal.gpu.A10G()
 WANDB_SECRET = modal.Secret.from_name("wandb")
 
 COMMON_ENV = {
