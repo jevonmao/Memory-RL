@@ -105,6 +105,49 @@ def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
         return DummyVecEnv([_thunk(0)])
 
 
+def _load_bc_weights_zero_padded(ppo_policy, bc_policy) -> None:
+    """Transfer BC weights into a PPO policy whose obs space is wider.
+
+    The BC policy was trained on 15-D proprioception.  The PPO policy has
+    15-D + N-D object state.  The first linear layer in both the actor and
+    critic networks therefore has shape [h, 15] in BC and [h, 15+N] in PPO.
+
+    We copy the BC weights into the first 15 columns and leave the remaining
+    N columns at zero.  All subsequent layers are copied unchanged (their
+    shapes are identical because only the input dimension changed).
+
+    At the start of PPO training the object-state columns are zero, so the
+    policy is mathematically equivalent to the BC policy.  Gradient descent
+    then learns to use the new object-state inputs over time.
+    """
+    import torch
+    bc_sd = bc_policy.state_dict()
+    ppo_sd = ppo_policy.state_dict()
+    bc_obs_dim = bc_policy.observation_space.shape[0]
+    ppo_obs_dim = ppo_policy.observation_space.shape[0]
+
+    new_sd = {}
+    for k, v in bc_sd.items():
+        if v.ndim == 2 and v.shape[1] == bc_obs_dim:
+            # Input-layer weight: zero-pad new columns
+            new_w = torch.zeros(v.shape[0], ppo_obs_dim, dtype=v.dtype)
+            new_w[:, :bc_obs_dim] = v
+            new_sd[k] = new_w
+        elif k in ppo_sd and ppo_sd[k].shape == v.shape:
+            new_sd[k] = v
+        else:
+            print(f"[train_ppo] BC weight '{k}': shape {tuple(v.shape)} vs PPO "
+                  f"{tuple(ppo_sd[k].shape) if k in ppo_sd else 'missing'} — using PPO init")
+            if k in ppo_sd:
+                new_sd[k] = ppo_sd[k]
+
+    for k in ppo_sd:
+        if k not in new_sd:
+            new_sd[k] = ppo_sd[k]
+
+    ppo_policy.load_state_dict(new_sd)
+
+
 def _run_post_eval(model, cfg, env_kwargs, run_dir):
     """Run deterministic evaluation on the val split and print + save metrics."""
     from env.robomme_env import make_env
@@ -243,19 +286,19 @@ def main():
         bc_model = PPO.load(str(bc_path), device=cfg.get("device", "auto"))
         bc_obs_shape = bc_model.policy.observation_space.shape
         ppo_obs_shape = model.policy.observation_space.shape
-        if bc_obs_shape != ppo_obs_shape:
-            print(
-                f"[train_ppo] WARNING: BC obs shape {bc_obs_shape} ≠ "
-                f"env obs shape {ppo_obs_shape}.\n"
-                f"           This usually means the live env obs extraction is\n"
-                f"           incomplete (e.g. EEF state missing from extra dict).\n"
-                f"           Check the stderr output from robomme_env.py for the\n"
-                f"           exact extra keys and update _extract_native_maniskill_obs.\n"
-                f"           Skipping BC warm-start — training from random init."
-            )
-        else:
+        if bc_obs_shape == ppo_obs_shape:
             model.policy.load_state_dict(bc_model.policy.state_dict())
-            print("[train_ppo] BC policy weights loaded")
+            print("[train_ppo] BC policy weights loaded (obs dims match)")
+        elif len(bc_obs_shape) == 1 and len(ppo_obs_shape) == 1 and ppo_obs_shape[0] > bc_obs_shape[0]:
+            _load_bc_weights_zero_padded(model.policy, bc_model.policy)
+            print(f"[train_ppo] BC policy weights loaded with zero-padding "
+                  f"({bc_obs_shape[0]}-D → {ppo_obs_shape[0]}-D obs); "
+                  f"new object-state columns initialised to zero")
+        else:
+            print(
+                f"[train_ppo] WARNING: BC obs shape {bc_obs_shape} incompatible with "
+                f"env obs shape {ppo_obs_shape} — skipping BC warm-start."
+            )
         del bc_model
 
     wandb_run = None

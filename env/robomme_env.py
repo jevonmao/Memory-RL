@@ -205,12 +205,20 @@ class RoboMMEEnv(gym.Env):
     gymnasium wrapper — in particular DemonstrationWrapper and its mplib
     motion-planning dependency.
 
-    Observations are read directly from the SAPIEN physics simulation after
-    every reset() and step():
-      eef_state    (6,)  TCP position [x,y,z] + orientation [roll,pitch,yaw]
-      joint_state  (7,)  arm qpos[:7]
-      gripper_state(2,)  finger qpos[7:9]
-    Total obs_dim = 15, matching the BC training data from the H5 dataset.
+    Observations are built from two sources:
+      Proprioception (15-D, always present):
+        eef_state    (6,)  TCP position [x,y,z] + orientation [roll,pitch,yaw]
+        joint_state  (7,)  arm qpos[:7]
+        gripper_state(2,)  finger qpos[7:9]
+      Object state (N-D, discovered at init from ManiSkill's native obs):
+        Everything ManiSkill returns outside of the 'agent' block — object
+        poses, goal positions, task-progress signals, etc.  Dimension N is
+        determined once at construction time by sampling a reset().
+
+    When a BC checkpoint is loaded, the proprioception block matches exactly
+    (15-D).  The object-state columns are zero-initialised so the policy
+    starts by ignoring them and behaves identically to the BC policy; PPO
+    then learns to use them.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"]}
@@ -249,6 +257,7 @@ class RoboMMEEnv(gym.Env):
         self._prev_task_index = 0
         self._step_count = 0
         self._reset_count = 0
+        self._obj_obs_dim = 0       # set below after sampling a native reset()
 
         self._backend, self._builder, _gym_env = self._init_backend(allow_gym_fallback)
 
@@ -259,8 +268,10 @@ class RoboMMEEnv(gym.Env):
         else:
             # Open one episode to determine obs/act spaces.
             self._inner = self._open_episode_env(self._select_episode(seed))
-            self._inner.reset()
-            sample_obs = self._obs_from_sapien()
+            _init_result = self._inner.reset()
+            _init_native = _init_result[0] if isinstance(_init_result, tuple) else _init_result
+            self._obj_obs_dim = self._discover_obj_obs_dim(_init_native)
+            sample_obs = self._obs_from_sapien(_init_native)
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0, shape=sample_obs.shape, dtype=np.float32
             )
@@ -370,18 +381,21 @@ class RoboMMEEnv(gym.Env):
     # Observation extraction from SAPIEN
     # -----------------------------------------------------------------------
 
-    def _obs_from_sapien(self) -> np.ndarray:
-        """Extract [eef(6) + joint(7) + gripper(2)] from the live SAPIEN sim.
+    def _obs_from_sapien(self, native_obs=None) -> np.ndarray:
+        """Return the full observation: proprioception (15-D) + object state (N-D).
 
-        After reset() or step(), SAPIEN has already solved FK for the current
-        joint configuration.  We read:
-          agent.tcp.pose         → TCP position + quaternion → pos + rpy
-          agent.robot.get_qpos() → all joint positions (9-D for Panda)
-
-        Note: _inner.reset() / _inner.step() return values are deliberately
-        ignored for obs.  We read SAPIEN state directly so obs is always in
-        the same format regardless of which gymnasium wrappers are in the stack.
+        native_obs is ManiSkill's raw step/reset return value.  When present,
+        its non-agent content is appended as the object-state block.  When None
+        (gymnasium-fallback or unavailable), only the 15-D proprioception is
+        returned.
         """
+        prop = self._prop_obs_from_sapien()
+        if self._obj_obs_dim > 0 and native_obs is not None:
+            return np.concatenate([prop, self._extract_obj_obs(native_obs)])
+        return prop
+
+    def _prop_obs_from_sapien(self) -> np.ndarray:
+        """Extract [eef(6) + joint(7) + gripper(2)] from the live SAPIEN sim."""
         import sys as _sys
         env = self._inner
 
@@ -432,6 +446,64 @@ class RoboMMEEnv(gym.Env):
         return np.concatenate([eef_state, joint_state, gripper_state])  # (15,)
 
     # -----------------------------------------------------------------------
+    # Object-state helpers
+    # -----------------------------------------------------------------------
+
+    def _raw_obj_obs(self, native_obs) -> np.ndarray:
+        """Flatten ManiSkill's native obs into a 1-D float32 array.
+
+        ManiSkill returns obs as a dict with an 'agent' block (robot state,
+        already covered by _prop_obs_from_sapien) and an 'extra' block (object
+        poses, goal positions, task progress, etc.).  We skip 'agent' and
+        flatten everything else.  Falls back to an empty array on failure.
+        """
+        if native_obs is None:
+            return np.zeros(0, dtype=np.float32)
+        try:
+            if isinstance(native_obs, dict):
+                parts: List[np.ndarray] = []
+                for key in sorted(native_obs.keys()):
+                    if key == "agent":
+                        continue
+                    val = native_obs[key]
+                    if isinstance(val, dict):
+                        for k in sorted(val.keys()):
+                            v = np.asarray(val[k]).flatten().astype(np.float32)
+                            if v.size > 0 and np.isfinite(v).all():
+                                parts.append(v)
+                    else:
+                        v = np.asarray(val).flatten().astype(np.float32)
+                        if v.size > 0 and np.isfinite(v).all():
+                            parts.append(v)
+                return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+            else:
+                v = np.asarray(native_obs).flatten().astype(np.float32)
+                return v if np.isfinite(v).all() else np.zeros(0, dtype=np.float32)
+        except Exception:
+            return np.zeros(0, dtype=np.float32)
+
+    def _discover_obj_obs_dim(self, native_obs) -> int:
+        """Return the dimension of the object-state vector for this env."""
+        return len(self._raw_obj_obs(native_obs))
+
+    def _extract_obj_obs(self, native_obs) -> np.ndarray:
+        """Return object-state vector of shape (self._obj_obs_dim,).
+
+        Values are clipped to [-10, 10].  If extraction fails, returns zeros
+        so the policy falls back to BC-equivalent behaviour.
+        """
+        if self._obj_obs_dim == 0:
+            return np.zeros(0, dtype=np.float32)
+        try:
+            raw = self._raw_obj_obs(native_obs)
+            out = np.zeros(self._obj_obs_dim, dtype=np.float32)
+            n = min(len(raw), self._obj_obs_dim)
+            out[:n] = np.clip(raw[:n], -10.0, 10.0)
+            return out
+        except Exception:
+            return np.zeros(self._obj_obs_dim, dtype=np.float32)
+
+    # -----------------------------------------------------------------------
     # Gymnasium API
     # -----------------------------------------------------------------------
 
@@ -450,15 +522,16 @@ class RoboMMEEnv(gym.Env):
         else:
             info = {}
 
-        self._inner.reset()         # initialise physics + FK
-        obs = self._obs_from_sapien()
+        _native = self._inner.reset()   # initialise physics + FK
+        _native_obs = _native[0] if isinstance(_native, tuple) else _native
+        obs = self._obs_from_sapien(_native_obs)
         return obs, info
 
     def step(self, action):
         if self._backend != "robomme":
             return self._inner.step(action)
 
-        _, _reward_env, terminated, truncated, info = self._inner.step(action)
+        _native_obs, _reward_env, terminated, truncated, info = self._inner.step(action)
 
         # Convert ManiSkill tensor types → plain Python
         terminated = bool(
@@ -488,7 +561,7 @@ class RoboMMEEnv(gym.Env):
             truncated = True
 
         # Read obs from SAPIEN AFTER physics step
-        obs = self._obs_from_sapien()
+        obs = self._obs_from_sapien(_native_obs)
 
         # Reward engineering
         reward = self._compute_reward(info, terminated, truncated)
