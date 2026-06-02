@@ -199,72 +199,8 @@ def _patch_demonstration_wrapper() -> None:
 
 
 def _apply_robomme_patches() -> None:
-    """One-time patches for panda_wristcam → panda URDF substitution.
-
-    DemonstrationWrapper.reset() calls get_demonstration_trajectory() which
-    creates PandaMotionPlanner → mplib.Planner(urdf=robot.urdf_path, ...).
-    panda_wristcam's URDF makes mplib's C++ ArticulatedModel segfault.
-
-    mplib.Planner.__init__ is pure Python so we can intercept it before the
-    C++ call and swap the wristcam URDF for the standard panda URDF (same
-    kinematic chain, valid mplib asset).
-    """
-    import os as _os, sys as _sys
-
-    # --- gym.make: log what robot_uids is actually passed -----------------
-    if not getattr(gym, "_robomme_patch_applied", False):
-        _orig_make = gym.make
-
-        def _patched_gym_make(env_id, **kwargs):
-            robot = kwargs.get("robot_uids", "<not in kwargs>")
-            _sys.stderr.write(
-                f"[robomme patch] gym.make({env_id!r}, robot_uids={robot!r})\n"
-            )
-            _sys.stderr.flush()
-            if "wristcam" in str(robot):
-                kwargs["robot_uids"] = "panda"
-            return _orig_make(env_id, **kwargs)
-
-        gym.make = _patched_gym_make
-        gym._robomme_patch_applied = True
-
-    # --- mplib.Planner: replace wristcam URDF path with panda path --------
-    try:
-        import mplib as _mplib
-
-        if getattr(_mplib.Planner, "_robomme_patch_applied", False):
-            return
-
-        _orig_planner_init = _mplib.Planner.__init__
-
-        def _patched_planner_init(self, *args, **kwargs):
-            # Resolve urdf from first positional arg or keyword arg.
-            urdf = args[0] if args else kwargs.get("urdf", "")
-            if "wristcam" in str(urdf):
-                panda_urdf = str(urdf).replace("panda_wristcam", "panda")
-                if _os.path.exists(panda_urdf):
-                    _sys.stderr.write(
-                        f"[mplib patch] wristcam→panda: {panda_urdf}\n"
-                    )
-                    _sys.stderr.flush()
-                    if args:
-                        args = (panda_urdf,) + args[1:]
-                    else:
-                        kwargs["urdf"] = panda_urdf
-            # Forward all args/kwargs exactly as received — avoids "multiple
-            # values" errors that arise when explicit param names conflict with
-            # the kwargs dict.
-            return _orig_planner_init(self, *args, **kwargs)
-
-        _patched_planner_init._robomme_patch_applied = True
-        _mplib.Planner.__init__ = _patched_planner_init
-        _mplib.Planner._robomme_patch_applied = True
-        _sys.stderr.write("[robomme patch] mplib.Planner.__init__ patched\n")
-        _sys.stderr.flush()
-
-    except Exception as exc:
-        _sys.stderr.write(f"[robomme patch] mplib patch failed: {exc}\n")
-        _sys.stderr.flush()
+    """No-op stub kept for call-site compatibility. Real fix is in
+    _patch_demonstration_wrapper() which bypasses mplib entirely."""
 
 
 class RoboMMEEnv(gym.Env):
@@ -357,16 +293,7 @@ class RoboMMEEnv(gym.Env):
             except Exception:
                 pass
 
-        # DemonstrationWrapper.reset() creates PandaMotionPlanner(env), which
-        # calls mplib.Planner(urdf=self.robot.urdf_path, ...). For panda_wristcam
-        # the URDF path resolves to the wristcam variant which mplib's C++
-        # ArticulatedModel cannot load → segfault.
-        #
-        # mplib.Planner.__init__ is pure Python so we CAN monkey-patch it.
-        # We replace any panda_wristcam URDF path with the standard panda path
-        # (same kinematic chain, valid mplib URDF). Both patches log to stderr
-        # so we can see which paths are actually being used.
-        _apply_robomme_patches()
+        _apply_robomme_patches()  # no-op; real fix below after robomme import
 
         robomme = _try_import_robomme()
         if robomme is not None:
