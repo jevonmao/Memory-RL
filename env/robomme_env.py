@@ -115,6 +115,29 @@ class EnvMetadata:
     extra: Dict[str, Any]
 
 
+def _sanitize_info(info: Any) -> Dict[str, Any]:
+    """Convert a ManiSkill info dict to plain Python types.
+
+    SubprocVecEnv pickles info dicts across processes; PyTorch tensors and
+    numpy scalars with non-standard dtypes cause pickling or stacking errors.
+    We convert every value to a Python scalar, list, or numpy array.
+    """
+    if not isinstance(info, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in info.items():
+        try:
+            if hasattr(v, "item"):          # 0-d tensor or numpy scalar
+                out[k] = v.item()
+            elif hasattr(v, "tolist"):      # tensor / ndarray with shape
+                out[k] = v.tolist()
+            else:
+                out[k] = v
+        except Exception:
+            out[k] = v
+    return out
+
+
 def list_tasks() -> List[str]:
     robomme = _try_import_robomme()
     if robomme is not None:
@@ -184,6 +207,7 @@ class RoboMMEEnv(gym.Env):
         self._episode_num: Optional[int] = None
         self._inner = None          # raw ManiSkill env (unwrapped)
         self._prev_task_index = 0
+        self._step_count = 0
 
         self._backend, self._builder, _gym_env = self._init_backend(allow_gym_fallback)
 
@@ -227,6 +251,8 @@ class RoboMMEEnv(gym.Env):
 
         robomme = _try_import_robomme()
         if robomme is not None:
+            # Re-apply after robomme/mani_skill import, which resets the level.
+            logging.getLogger("mani_skill").setLevel(logging.ERROR)
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
             builder = BenchmarkEnvBuilder(
                 env_id=self.task_name,
@@ -369,6 +395,7 @@ class RoboMMEEnv(gym.Env):
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         self._prev_task_index = 0
+        self._step_count = 0
 
         if self._backend != "robomme":
             return self._inner.reset(seed=seed, options=options)
@@ -392,7 +419,7 @@ class RoboMMEEnv(gym.Env):
         truncated = bool(
             np.asarray(truncated).item() if hasattr(truncated, "item") else truncated
         )
-        info = dict(info) if isinstance(info, dict) else {}
+        info = _sanitize_info(info)
 
         # BinFill.evaluate() sets info["fail"] when a task fails (e.g. wrong
         # cube dropped, or button pressed before bin is filled).
@@ -405,6 +432,12 @@ class RoboMMEEnv(gym.Env):
                     terminated = True
             except Exception:
                 pass
+
+        # Enforce max_steps: .unwrapped strips the TimeLimit gymnasium wrapper,
+        # so we must track the step count ourselves.
+        self._step_count = getattr(self, "_step_count", 0) + 1
+        if self._max_steps > 0 and self._step_count >= self._max_steps:
+            truncated = True
 
         # Read obs from SAPIEN AFTER physics step
         obs = self._obs_from_sapien()
@@ -435,8 +468,10 @@ class RoboMMEEnv(gym.Env):
                 reward += self._subtask_reward * (curr_idx - self._prev_task_index)
                 self._prev_task_index = curr_idx
 
-        # −step_penalty per non-terminal step
-        if self._step_penalty > 0.0 and not (terminated or truncated):
+        # −step_penalty on every step that isn't a true termination (success/fail).
+        # Truncation (time limit) still incurs the penalty so that the episode
+        # total matches: n_subtasks × subtask_reward − max_steps × step_penalty.
+        if self._step_penalty > 0.0 and not terminated:
             reward -= self._step_penalty
 
         return reward
