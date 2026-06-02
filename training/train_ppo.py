@@ -57,12 +57,13 @@ def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
     fns = [_thunk(i) for i in range(n_envs)]
     if force_dummy or n_envs == 1:
         return DummyVecEnv(fns)
-    # ManiSkill/SAPIEN initializes CUDA in each env subprocess. fork() inherits
-    # the parent's CUDA context and cannot re-initialize it, causing a crash.
-    # spawn starts fresh subprocesses with no inherited CUDA state, which is
-    # required whenever CUDA is used in the parent before the fork (e.g. from
-    # set_global_seed → torch.cuda.manual_seed_all, or BC checkpoint loading).
-    return SubprocVecEnv(fns, start_method="spawn")
+    # fork is safe here because set_global_seed() (which calls
+    # torch.cuda.manual_seed_all and initializes CUDA) is called AFTER
+    # _make_vec_env() in main(). Forking before CUDA init lets each subprocess
+    # initialize CUDA independently via ManiSkill/SAPIEN.
+    import platform
+    start_method = "fork" if platform.system() == "Linux" else None
+    return SubprocVecEnv(fns, start_method=start_method)
 
 
 def _run_post_eval(model, cfg, env_kwargs, run_dir):
@@ -138,7 +139,6 @@ def main():
 
     PPO, CheckpointCallback, EvalCallback, Monitor, DummyVecEnv, SubprocVecEnv = _require_sb3()
 
-    set_global_seed(cfg["seed"], deterministic=cfg.get("deterministic_torch", False))
     run_dir = build_run_dir(cfg["output_dir"], cfg["task_name"], cfg["seed"], tag=args.tag)
     save_run_config(run_dir, cfg)
 
@@ -173,6 +173,13 @@ def main():
         cfg.get("allow_gym_fallback", False), eval_env_kwargs,
         Monitor, DummyVecEnv, SubprocVecEnv, force_dummy=True,
     )
+
+    # Set global seed AFTER forking the vec envs. torch.cuda.manual_seed_all()
+    # initializes the CUDA context in the parent process; if called before fork,
+    # child processes inherit a half-initialized CUDA state and crash when
+    # ManiSkill/SAPIEN tries to use it. Forking first lets each subprocess
+    # initialize CUDA independently.
+    set_global_seed(cfg["seed"], deterministic=cfg.get("deterministic_torch", False))
 
     model = PPO(
         policy=cfg.get("policy", "MlpPolicy"),
