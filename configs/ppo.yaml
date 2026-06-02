@@ -1,41 +1,42 @@
 task_name: BinFill
 seed: 0
-total_timesteps: 10000000  # 10 M steps — minimum viable budget for manipulation with intrinsic reward
+total_timesteps: 10000000  # 10 M steps for a full run; use --total_steps 100000 for a quick VM smoke-test
 
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-# flatten_keys selects the three numeric state streams (obs_dim = 15).
-# Image streams are ignored to avoid expensive pixel processing.
+# Obs (15-D) is extracted directly from the live SAPIEN physics sim:
+#   eef_state (6)  = TCP [x,y,z, roll,pitch,yaw]  via agent.tcp.pose
+#   joint_state(7) = arm qpos[:7]                   via agent.robot.get_qpos()
+#   gripper_state(2)= finger qpos[7:9]
+# flatten_keys is kept for API compatibility but is IGNORED by robomme_env.py.
 env_kwargs:
   dataset: train
   action_space: joint_angle
-  max_steps: 600            # BinFill sub-task count is variable (2×total_cubes+1, up to ~13 tasks);
-                            # each task needs ~30-50 steps → up to ~650 steps worst case; 600 is a
-                            # reasonable budget that covers most episodes without padding too much
+  max_steps: 600            # BinFill has up to ~13 sequential sub-tasks, each ~30-50 steps
   episode_idx: null
   flatten_obs: true
-  flatten_keys:
-    - eef_state_list        # (6,)  end-effector pos + rpy
-    - joint_state_list      # (7,)  joint positions
-    - gripper_state_list    # (2,)  gripper state
+  flatten_keys:             # ignored — obs comes from SAPIEN directly
+    - eef_state_list
+    - joint_state_list
+    - gripper_state_list
   episode_kwargs: {}
   builder_kwargs: {}
-  subtask_reward: 1.0       # +1 per sub-task completed (0.0 to disable)
-  step_penalty: 0.005       # subtracted every non-terminal step; kept small so completing at max_steps
-                            # still beats failing: e.g. 7-task BinFill: 8.0 reward − 600×0.005 = +5.0
+  subtask_reward: 1.0       # +1 per sub-task completed; dense signal for BinFill
+  step_penalty: 0.005       # −per non-terminal step; e.g. 7-task BinFill: 8.0 − 600×0.005 = +5.0
 
 # ---------------------------------------------------------------------------
 # PPO hyperparameters
 # ---------------------------------------------------------------------------
-# Rollout buffer per update: n_envs × n_steps = 16 × 512 = 8 192 transitions.
-# batch_size must divide that total exactly; train_ppo.py auto-adjusts if not.
-# 8 192 / 1 024 = 8 minibatches × 8 epochs = 64 gradient steps per update.
-learning_rate: 3.0e-4       # Adam LR; 3e-4 is the standard PPO starting point
-n_steps: 512                # steps collected per env per update
-batch_size: 1024            # must divide n_envs × n_steps (16 × 512 = 8 192); gives 8 minibatches
-n_epochs: 8                 # PPO reuse epochs per rollout; 4 is conservative (safe from high KL);
-                            # can raise to 8-10 if approx_kl stays below 0.02
+# Rollout buffer per update: n_envs × n_steps transitions.
+#   n_envs=8:  8 × 1024 = 8192  → batch 1024 → 8 minibatches × 8 epochs = 64 grad steps
+#              8192 steps / 600 max_steps ≈ 13 complete episodes per update  (good diversity)
+#              each env sees ~1.7 complete episodes per rollout  (good advantage estimation)
+# train_ppo.py auto-adjusts batch_size downward if it doesn't divide rollout evenly.
+learning_rate: 3.0e-4       # standard PPO starting point; reduce to 1e-4 if KL diverges
+n_steps: 1024               # steps per env per update; 8×1024=8192 covers ~13 BinFill episodes
+batch_size: 1024            # 8192/1024 = 8 minibatches; must divide n_envs×n_steps exactly
+n_epochs: 8                 # PPO reuse epochs per rollout; reduce to 4 if approx_kl > 0.02
 gamma: 0.99                 # discount; effective horizon ≈ 1/(1-γ) = 100 steps, fine for max_steps=600
 gae_lambda: 0.95            # GAE λ; high bias–variance trade-off standard
 clip_range: 0.2             # PPO clip ε; standard starting point; reduce to 0.1 if unstable
@@ -67,7 +68,7 @@ checkpoint_interval: 1000000
 #   16 GB VRAM  →  n_envs: 16–32
 #   40 GB VRAM  →  n_envs: 32–64
 # batch_size must divide n_envs × n_steps; train_ppo.py auto-adjusts if not.
-n_envs: 1
+n_envs: 8                   # 8 parallel SAPIEN envs; needs ~8 GB GPU VRAM; falls back to 1 if OOM
 allow_gym_fallback: false
 deterministic_torch: false
 
