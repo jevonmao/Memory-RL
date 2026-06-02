@@ -497,6 +497,12 @@ class RoboMMEEnv(gym.Env):
 
         _apply_robomme_patches()  # no-op; real fix below after robomme import
 
+        # Suppress the repeated ManiSkill warning about panda_wristcam not being
+        # in BinFill's official supported-robot list. The robot has identical
+        # kinematics to panda; the warning is expected and not actionable.
+        import logging as _logging
+        _logging.getLogger("mani_skill").setLevel(_logging.ERROR)
+
         robomme = _try_import_robomme()
         if robomme is not None:
             _patch_demonstration_wrapper()
