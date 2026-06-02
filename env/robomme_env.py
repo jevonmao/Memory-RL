@@ -186,14 +186,15 @@ def _extract_native_maniskill_obs(obs: Dict[str, Any]) -> Dict[str, List[np.ndar
                 continue
 
     if tcp is None:
-        # Log once so the user knows which extra keys exist
-        _sys.stderr.write(
-            f"[robomme] WARNING: could not find EEF state in extra.\n"
-            f"  extra keys: {list(extra.keys())}\n"
-            f"  obs_dim will be 9 instead of 15 — BC checkpoint load will fail.\n"
-            f"  Hint: check extra key names and update _extract_native_maniskill_obs.\n"
-        )
-        _sys.stderr.flush()
+        import sys as _sys2
+        if not getattr(_extract_native_maniskill_obs, "_warned", False):
+            _sys2.stderr.write(
+                f"[robomme] WARNING: could not find EEF state in extra.\n"
+                f"  extra keys: {list(extra.keys())}\n"
+                f"  obs_dim will be 9 instead of 15 — BC checkpoint load will fail.\n"
+            )
+            _sys2.stderr.flush()
+            _extract_native_maniskill_obs._warned = True
     else:
         if len(tcp) == 7:
             pos = tcp[:3]
@@ -356,30 +357,39 @@ def _patch_demonstration_wrapper() -> None:
             _sys.stderr.write("[robomme patch] WARNING: setup_planner not found\n")
             _sys.stderr.flush()
 
-        # --- 2. Wrap reset() to survive the downstream AttributeError --------
+        # --- 2. Patch get_demonstration_trajectory to swallow planner errors ---
+        # With setup_planner as a no-op, self.planner = None. When the function
+        # tries to call planning methods it raises AttributeError. We catch that
+        # here and return [] so the REST of DemonstrationWrapper.reset() continues
+        # — including the obs-transformation step that adds eef_state / joint_state
+        # / gripper_state (15-D). The planner is only used to generate the demo
+        # trajectory which PPO doesn't need.
+        _orig_get_demo = DemonstrationWrapper.get_demonstration_trajectory
+
+        def _safe_get_demo(self):
+            try:
+                return _orig_get_demo(self)
+            except (AttributeError, TypeError):
+                return []   # empty trajectory — obs transformation still runs
+
+        DemonstrationWrapper.get_demonstration_trajectory = _safe_get_demo
+
+        # --- 3. Safety-net wrapper around reset() ----------------------------
+        # If reset() crashes for any other reason (e.g. it can't handle an
+        # empty demo_batch), fall back to raw env.reset() which gives 9-D obs.
         _orig_reset = DemonstrationWrapper.reset
 
         def _safe_reset(self, seed=None, options=None):
             try:
-                # Let the normal reset() run.  The obs transformation (eef_state
-                # etc.) happens here.  get_demonstration_trajectory() will be
-                # called, create the planner, and then fail with AttributeError
-                # ("'NoneType' has no attribute '…'") when it tries to use
-                # self.planner.  That error is caught below.
                 return _orig_reset(self, seed=seed, options=options)
-            except (AttributeError, TypeError):
-                # Trajectory planning failed because self.planner = None.
-                # The obs transformation already ran before this crash, so the
-                # underlying env is in a valid reset state.  Re-run only the
-                # base env reset to get a fresh obs with correct keys.
-                obs, info = self.env.reset(seed=seed, options=options)
-                return obs, info
+            except Exception:
+                return self.env.reset(seed=seed, options=options)
 
         DemonstrationWrapper.reset = _safe_reset
         DemonstrationWrapper._ppo_patch_applied = True
         _sys.stderr.write(
             "[robomme patch] DemonstrationWrapper patched: "
-            "setup_planner=no-op, reset=safe_reset\n"
+            "setup_planner=no-op, get_demo=safe[], reset=safe\n"
         )
         _sys.stderr.flush()
 
