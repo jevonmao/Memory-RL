@@ -327,17 +327,34 @@ def _patch_demonstration_wrapper() -> None:
     import sys as _sys
     try:
         from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper
-        from mani_skill.examples.motionplanning.base_motionplanner.motionplanner \
-            import BaseMotionPlanner
 
         if getattr(DemonstrationWrapper, "_ppo_patch_applied", False):
             return
 
         # --- 1. Disable setup_planner so mplib C++ is never called -----------
+        # Find the class that *defines* setup_planner without importing by name,
+        # since the class name differs across ManiSkill versions.
         def _noop_setup_planner(self):
             self.planner = None   # planner exists but does nothing
 
-        BaseMotionPlanner.setup_planner = _noop_setup_planner
+        import inspect as _inspect
+        import importlib as _importlib
+        _base_mod = _importlib.import_module(
+            "mani_skill.examples.motionplanning.base_motionplanner.motionplanner"
+        )
+        _patched = False
+        for _cls_name, _cls in _inspect.getmembers(_base_mod, _inspect.isclass):
+            if "setup_planner" in _cls.__dict__:
+                _cls.setup_planner = _noop_setup_planner
+                _patched = True
+                _sys.stderr.write(
+                    f"[robomme patch] {_cls_name}.setup_planner = no-op\n"
+                )
+                _sys.stderr.flush()
+                break
+        if not _patched:
+            _sys.stderr.write("[robomme patch] WARNING: setup_planner not found\n")
+            _sys.stderr.flush()
 
         # --- 2. Wrap reset() to survive the downstream AttributeError --------
         _orig_reset = DemonstrationWrapper.reset
