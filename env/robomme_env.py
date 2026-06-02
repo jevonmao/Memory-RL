@@ -200,29 +200,24 @@ def _apply_robomme_patches() -> None:
 
         _orig_planner_init = _mplib.Planner.__init__
 
-        def _patched_planner_init(self, urdf, srdf, user_link_names,
-                                   user_joint_names, **kwargs):
-            _sys.stderr.write(
-                f"[mplib patch] urdf={urdf}\n"
-                f"[mplib patch] exists={_os.path.exists(urdf)}\n"
-            )
-            _sys.stderr.flush()
-
+        def _patched_planner_init(self, *args, **kwargs):
+            # Resolve urdf from first positional arg or keyword arg.
+            urdf = args[0] if args else kwargs.get("urdf", "")
             if "wristcam" in str(urdf):
-                panda_urdf = urdf.replace("panda_wristcam", "panda")
-                _sys.stderr.write(
-                    f"[mplib patch] wristcam detected → trying {panda_urdf}\n"
-                    f"[mplib patch] panda_exists={_os.path.exists(panda_urdf)}\n"
-                )
-                _sys.stderr.flush()
+                panda_urdf = str(urdf).replace("panda_wristcam", "panda")
                 if _os.path.exists(panda_urdf):
-                    urdf = panda_urdf
-                    if srdf and "wristcam" in str(srdf):
-                        srdf = srdf.replace("panda_wristcam", "panda")
-
-            return _orig_planner_init(
-                self, urdf, srdf, user_link_names, user_joint_names, **kwargs
-            )
+                    _sys.stderr.write(
+                        f"[mplib patch] wristcam→panda: {panda_urdf}\n"
+                    )
+                    _sys.stderr.flush()
+                    if args:
+                        args = (panda_urdf,) + args[1:]
+                    else:
+                        kwargs["urdf"] = panda_urdf
+            # Forward all args/kwargs exactly as received — avoids "multiple
+            # values" errors that arise when explicit param names conflict with
+            # the kwargs dict.
+            return _orig_planner_init(self, *args, **kwargs)
 
         _patched_planner_init._robomme_patch_applied = True
         _mplib.Planner.__init__ = _patched_planner_init
