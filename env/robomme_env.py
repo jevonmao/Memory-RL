@@ -229,6 +229,28 @@ class RoboMMEEnv(gym.Env):
         )
 
     def _init_backend(self, allow_gym_fallback: bool) -> Tuple[str, Any, Any]:
+        # SAPIEN needs two env vars for headless GPU rendering on compute VMs:
+        #
+        #   SAPIEN_RENDER_DEVICE=cuda  — tells SAPIEN to use the CUDA/GPU renderer
+        #   VK_ICD_FILENAMES           — points Vulkan at SAPIEN's bundled NVIDIA
+        #                               ICD so it doesn't rely on the system-wide
+        #                               Vulkan installation (which may be absent).
+        #
+        # SAPIEN ships nvidia_icd.json inside its Python package under
+        # sapien/vulkan_library/. We auto-detect that path here so neither var
+        # needs to be exported manually before running the script.
+        import os as _os
+        _os.environ.setdefault("SAPIEN_RENDER_DEVICE", "cuda")
+        if not _os.environ.get("VK_ICD_FILENAMES"):
+            try:
+                import sapien as _sapien
+                from pathlib import Path as _P
+                _icd = _P(_sapien.__file__).parent / "vulkan_library" / "nvidia_icd.json"
+                if _icd.exists():
+                    _os.environ["VK_ICD_FILENAMES"] = str(_icd)
+            except Exception:
+                pass
+
         robomme = _try_import_robomme()
         if robomme is not None:
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
