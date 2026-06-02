@@ -161,6 +161,43 @@ def _action_space_for(name: str) -> spaces.Space:
     )
 
 
+def _patch_demonstration_wrapper() -> None:
+    """Bypass DemonstrationWrapper.get_demonstration_trajectory() for PPO.
+
+    get_demonstration_trajectory() creates PandaMotionPlanner which calls
+    mplib.Planner → C++ ArticulatedModel → segfault on this machine.
+
+    PPO does not need demonstration trajectories — only the underlying
+    BinFill env's reset (valid physical scene, correct obs) is required.
+    This replaces DemonstrationWrapper.reset() with a direct passthrough
+    to self.env.reset(), completely skipping the mplib call.
+
+    Must be called after _try_import_robomme() has added robomme to sys.path.
+    """
+    import sys as _sys
+    try:
+        from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper
+
+        if getattr(DemonstrationWrapper, "_ppo_patch_applied", False):
+            return
+
+        def _direct_reset(self, seed=None, options=None):
+            return self.env.reset(seed=seed, options=options)
+
+        DemonstrationWrapper.reset = _direct_reset
+        DemonstrationWrapper._ppo_patch_applied = True
+        _sys.stderr.write(
+            "[robomme patch] DemonstrationWrapper.reset → direct env.reset() "
+            "(skipping get_demonstration_trajectory / mplib)\n"
+        )
+        _sys.stderr.flush()
+    except Exception as exc:
+        _sys.stderr.write(
+            f"[robomme patch] DemonstrationWrapper patch failed: {exc}\n"
+        )
+        _sys.stderr.flush()
+
+
 def _apply_robomme_patches() -> None:
     """One-time patches for panda_wristcam → panda URDF substitution.
 
@@ -333,6 +370,7 @@ class RoboMMEEnv(gym.Env):
 
         robomme = _try_import_robomme()
         if robomme is not None:
+            _patch_demonstration_wrapper()
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
             builder = BenchmarkEnvBuilder(
                 env_id=self.task_name,
