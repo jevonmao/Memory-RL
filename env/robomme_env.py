@@ -63,9 +63,31 @@ _ACTION_DIMS = {
     "waypoint": 7,
 }
 
-# Suppress panda_wristcam-not-supported spam from ManiSkill.
-# panda_wristcam is mechanically identical to panda; the warning is expected.
-logging.getLogger("mani_skill").setLevel(logging.ERROR)
+class _ManiSkillNoiseFilter(logging.Filter):
+    """Block known informational warnings that survive setLevel resets."""
+    _PATTERNS = ("panda_wristcam",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(p in record.getMessage() for p in self._PATTERNS)
+
+
+_MANI_SKILL_NOISE_FILTER = _ManiSkillNoiseFilter()
+
+
+def _suppress_mani_skill_noise() -> None:
+    """Set ERROR level and attach a filter on the mani_skill logger.
+
+    Called at import time and again before every make_env_for_episode() call,
+    because ManiSkill resets the logger level during env construction.
+    The filter is idempotent — it is added at most once.
+    """
+    logger = logging.getLogger("mani_skill")
+    logger.setLevel(logging.ERROR)
+    if _MANI_SKILL_NOISE_FILTER not in logger.filters:
+        logger.addFilter(_MANI_SKILL_NOISE_FILTER)
+
+
+_suppress_mani_skill_noise()
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +274,7 @@ class RoboMMEEnv(gym.Env):
         robomme = _try_import_robomme()
         if robomme is not None:
             # Re-apply after robomme/mani_skill import, which resets the level.
-            logging.getLogger("mani_skill").setLevel(logging.ERROR)
+            _suppress_mani_skill_noise()
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
             builder = BenchmarkEnvBuilder(
                 env_id=self.task_name,
@@ -313,6 +335,7 @@ class RoboMMEEnv(gym.Env):
                 self._inner.close()
             except Exception:
                 pass
+        _suppress_mani_skill_noise()
         wrapped = self._builder.make_env_for_episode(episode_idx, **self._episode_kwargs)
         env = wrapped.unwrapped   # raw ManiSkill BinFill env
 
