@@ -53,7 +53,7 @@ env_kwargs:
     - eef_state_list
     - joint_state_list
     - gripper_state_list
-  episode_kwargs: {robot_uids: panda}   # panda_wristcam has no mplib URDF → segfault
+  episode_kwargs: {}
   builder_kwargs: {}
   subtask_reward: 0.0       # no reward shaping during demo collection or BC
   step_penalty: 0.0

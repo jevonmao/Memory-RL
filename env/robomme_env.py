@@ -251,6 +251,23 @@ class RoboMMEEnv(gym.Env):
             except Exception:
                 pass
 
+        # BenchmarkEnvBuilder and make_env_for_episode() do not expose a
+        # robot_uids override. The recorded demos use panda_wristcam, which has
+        # identical kinematics to panda but no URDF in mplib's asset library.
+        # DemonstrationWrapper.reset() creates a PandaMotionPlanner that calls
+        # mplib.Planner(urdf_path) — if the path points to panda_wristcam,
+        # mplib's C++ layer segfaults. Patch gym.make once so any
+        # panda_wristcam robot_uids is silently promoted to panda before the
+        # ManiSkill env is created.
+        if not getattr(gym, "_robomme_wristcam_patch", False):
+            _orig_make = gym.make
+            def _make_panda(env_id, **kwargs):
+                if kwargs.get("robot_uids") == "panda_wristcam":
+                    kwargs["robot_uids"] = "panda"
+                return _orig_make(env_id, **kwargs)
+            gym.make = _make_panda
+            gym._robomme_wristcam_patch = True
+
         robomme = _try_import_robomme()
         if robomme is not None:
             from robomme.env_record_wrapper import BenchmarkEnvBuilder
