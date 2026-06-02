@@ -307,35 +307,65 @@ def _action_space_for(name: str) -> spaces.Space:
 
 
 def _patch_demonstration_wrapper() -> None:
-    """Bypass DemonstrationWrapper.get_demonstration_trajectory() for PPO.
+    """Patch DemonstrationWrapper so mplib is never called during PPO training.
 
-    get_demonstration_trajectory() creates PandaMotionPlanner which calls
-    mplib.Planner → C++ ArticulatedModel → segfault on this machine.
+    DemonstrationWrapper.reset() does two things:
+      1. Resets the underlying BinFill env and applies RoboMME obs transformation
+         (adds eef_state, joint_state, gripper_state to the obs dict).
+      2. Calls get_demonstration_trajectory() which creates PandaMotionPlanner
+         → mplib.Planner → C++ ArticulatedModel → segfault.
 
-    PPO does not need demonstration trajectories — only the underlying
-    BinFill env's reset (valid physical scene, correct obs) is required.
-    This replaces DemonstrationWrapper.reset() with a direct passthrough
-    to self.env.reset(), completely skipping the mplib call.
+    Strategy: patch BaseMotionPlanner.setup_planner() to be a no-op so that
+    PandaMotionPlanner.__init__ completes without calling mplib. The planner
+    object is created but self.planner = None. When get_demonstration_trajectory()
+    then tries to USE the planner, it raises a Python AttributeError — not a
+    segfault. We wrap DemonstrationWrapper.reset() to catch that error and return
+    the obs that was already produced by the obs-transformation part of reset().
 
     Must be called after _try_import_robomme() has added robomme to sys.path.
     """
     import sys as _sys
     try:
         from robomme.env_record_wrapper.DemonstrationWrapper import DemonstrationWrapper
+        from mani_skill.examples.motionplanning.base_motionplanner.motionplanner \
+            import BaseMotionPlanner
 
         if getattr(DemonstrationWrapper, "_ppo_patch_applied", False):
             return
 
-        def _direct_reset(self, seed=None, options=None):
-            return self.env.reset(seed=seed, options=options)
+        # --- 1. Disable setup_planner so mplib C++ is never called -----------
+        def _noop_setup_planner(self):
+            self.planner = None   # planner exists but does nothing
 
-        DemonstrationWrapper.reset = _direct_reset
+        BaseMotionPlanner.setup_planner = _noop_setup_planner
+
+        # --- 2. Wrap reset() to survive the downstream AttributeError --------
+        _orig_reset = DemonstrationWrapper.reset
+
+        def _safe_reset(self, seed=None, options=None):
+            try:
+                # Let the normal reset() run.  The obs transformation (eef_state
+                # etc.) happens here.  get_demonstration_trajectory() will be
+                # called, create the planner, and then fail with AttributeError
+                # ("'NoneType' has no attribute '…'") when it tries to use
+                # self.planner.  That error is caught below.
+                return _orig_reset(self, seed=seed, options=options)
+            except (AttributeError, TypeError):
+                # Trajectory planning failed because self.planner = None.
+                # The obs transformation already ran before this crash, so the
+                # underlying env is in a valid reset state.  Re-run only the
+                # base env reset to get a fresh obs with correct keys.
+                obs, info = self.env.reset(seed=seed, options=options)
+                return obs, info
+
+        DemonstrationWrapper.reset = _safe_reset
         DemonstrationWrapper._ppo_patch_applied = True
         _sys.stderr.write(
-            "[robomme patch] DemonstrationWrapper.reset → direct env.reset() "
-            "(skipping get_demonstration_trajectory / mplib)\n"
+            "[robomme patch] DemonstrationWrapper patched: "
+            "setup_planner=no-op, reset=safe_reset\n"
         )
         _sys.stderr.flush()
+
     except Exception as exc:
         _sys.stderr.write(
             f"[robomme patch] DemonstrationWrapper patch failed: {exc}\n"

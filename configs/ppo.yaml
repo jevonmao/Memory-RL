@@ -73,4 +73,4 @@ deterministic_torch: false
 
 output_dir: logs
 policy: MlpPolicy
-device: auto                # SB3 picks CUDA if available, else CPU
+device: cpu                 # MlpPolicy runs faster on CPU; GPU is reserved for SAPIEN physics
