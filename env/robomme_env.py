@@ -120,13 +120,19 @@ class _FlattenLatestObs:
         parts: List[np.ndarray] = []
         for k in self.keys:
             v = obs.get(k)
+            # Fall back to the base name without the _list suffix so this works
+            # whether the env returns the DemonstrationWrapper-wrapped list format
+            # ("eef_state_list") or the native BinFill/ManiSkill format ("eef_state").
+            if v is None and k.endswith("_list"):
+                v = obs.get(k[:-5])
             if v is None:
                 continue
             arr = np.asarray(v[-1] if isinstance(v, (list, tuple)) else v).astype(np.float32).flatten()
             parts.append(arr)
         if not parts:
             raise RuntimeError(
-                f"None of the requested keys {self.keys} were present in obs."
+                f"None of the requested keys {self.keys} were present in obs. "
+                f"Obs keys present: {list(obs.keys())}"
             )
         return np.concatenate(parts, axis=0)
 
