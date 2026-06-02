@@ -42,41 +42,63 @@ def _require_sb3():
 
 def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
                   Monitor, DummyVecEnv, SubprocVecEnv, *, force_dummy=False):
-    # Capture repo root here (parent process) so each subprocess can add it
-    # to sys.path. With spawn, sys.path is NOT inherited from the parent.
+    # Capture repo root in the parent so subprocesses can add it to sys.path.
+    # With spawn, sys.path is NOT inherited (each subprocess is a fresh Python).
     repo_root = str(Path(__file__).resolve().parents[1])
 
     def _thunk(rank: int):
         def _f():
-            # With spawn each subprocess starts as a fresh Python interpreter.
-            # Add the repo root so env.robomme_env (a local module, not an
-            # installed package) can be imported. cloudpickle serialises
-            # module-level functions by reference, so the import must succeed
-            # in the subprocess before make_env can be reconstructed.
-            import sys
-            if repo_root not in sys.path:
-                sys.path.insert(0, repo_root)
-            from env.robomme_env import make_env as _make_env       # type: ignore
-            from stable_baselines3.common.monitor import Monitor as _Monitor
-            return _Monitor(
-                _make_env(
-                    task_name, seed=seed + rank,
-                    allow_gym_fallback=allow_gym_fallback,
-                    env_kwargs=env_kwargs,
+            # Print any crash to stderr immediately so it isn't lost when the
+            # subprocess dies before the parent can read from the pipe.
+            import sys as _sys
+            try:
+                if repo_root not in _sys.path:
+                    _sys.path.insert(0, repo_root)
+                from env.robomme_env import make_env as _make_env       # type: ignore
+                from stable_baselines3.common.monitor import Monitor as _Monitor
+                return _Monitor(
+                    _make_env(
+                        task_name, seed=seed + rank,
+                        allow_gym_fallback=allow_gym_fallback,
+                        env_kwargs=env_kwargs,
+                    )
                 )
-            )
+            except Exception:
+                import traceback
+                _sys.stderr.write(
+                    f"\n[vec_env worker rank={rank}] env creation failed:\n"
+                    + traceback.format_exc() + "\n"
+                )
+                _sys.stderr.flush()
+                raise
         return _f
 
     fns = [_thunk(i) for i in range(n_envs)]
     if force_dummy or n_envs == 1:
         return DummyVecEnv(fns)
-    # spawn is required — fork is permanently broken when torch (and therefore
-    # torch.cuda) is imported in the parent process. torch/cuda/__init__.py sets
-    # _original_pid = os.getpid() at import time; every forked child has a
-    # different PID, so _lazy_init() raises "Cannot re-initialize CUDA in forked
-    # subprocess" the first time ManiSkill/SAPIEN calls any CUDA API, regardless
-    # of whether CUDA was explicitly used in the parent.
-    return SubprocVecEnv(fns, start_method="spawn")
+
+    # SubprocVecEnv + spawn is the only CUDA-safe multiprocessing strategy:
+    # fork inherits torch.cuda._original_pid from the parent and any CUDA call
+    # in the child raises "Cannot re-initialize CUDA in forked subprocess".
+    #
+    # However, spawning n_envs SAPIEN/ManiSkill processes simultaneously on a
+    # single GPU is often fatal: each fresh process imports torch + SAPIEN and
+    # initialises a GPU physics context. With n_envs=16 this can exceed GPU
+    # memory or hit kernel resource limits and the process is OOM-killed.
+    #
+    # Fallback: if SubprocVecEnv fails, drop to a single DummyVecEnv env.
+    # Training continues — just slower. Use --n_envs 1 to avoid the attempt.
+    try:
+        return SubprocVecEnv(fns, start_method="spawn")
+    except Exception as exc:
+        import sys as _sys
+        print(
+            f"\n[train_ppo] SubprocVecEnv(n_envs={n_envs}) failed: {exc}\n"
+            f"           Falling back to DummyVecEnv(n_envs=1).\n"
+            f"           Pass --n_envs 1 to use a single env from the start.",
+            file=_sys.stderr, flush=True,
+        )
+        return DummyVecEnv([_thunk(0)])
 
 
 def _run_post_eval(model, cfg, env_kwargs, run_dir):

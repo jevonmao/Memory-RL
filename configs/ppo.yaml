@@ -53,14 +53,20 @@ checkpoint_interval: 1000000
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------
-# n_envs: tuned for a GPU VM (ManiSkill/SAPIEN uses GPU for physics).
-# GPU parallelism allows more envs than CPU-only; VRAM is the main constraint.
-# Rule of thumb for ManiSkill on a single GPU:
+# n_envs controls how many parallel environments are created.
+#
+# On a VM (direct Python run): SAPIEN spawns a full GPU physics context per
+# subprocess. Spawning 16 simultaneously usually OOM-kills some. Use n_envs=1
+# (DummyVecEnv, single env in the main process) — slower but reliable.
+# If SubprocVecEnv fails at runtime, train_ppo.py auto-falls back to n_envs=1.
+#
+# On Modal (train_ppo Modal function): each Modal container has dedicated GPU,
+# so larger n_envs work. Tune to VRAM:
 #   8 GB  VRAM  →  n_envs: 8–16
-#   16 GB VRAM  →  n_envs: 16–32   (default below assumes ~16 GB)
+#   16 GB VRAM  →  n_envs: 16–32
 #   40 GB VRAM  →  n_envs: 32–64
 # batch_size must divide n_envs × n_steps; train_ppo.py auto-adjusts if not.
-n_envs: 16
+n_envs: 1
 allow_gym_fallback: false
 deterministic_torch: false
 
