@@ -241,9 +241,22 @@ def main():
             raise FileNotFoundError(f"BC checkpoint not found: {bc_path}")
         print(f"[train_ppo] warm-starting policy from BC checkpoint: {bc_path}")
         bc_model = PPO.load(str(bc_path), device=cfg.get("device", "auto"))
-        model.policy.load_state_dict(bc_model.policy.state_dict())
+        bc_obs_shape = bc_model.policy.observation_space.shape
+        ppo_obs_shape = model.policy.observation_space.shape
+        if bc_obs_shape != ppo_obs_shape:
+            print(
+                f"[train_ppo] WARNING: BC obs shape {bc_obs_shape} ≠ "
+                f"env obs shape {ppo_obs_shape}.\n"
+                f"           This usually means the live env obs extraction is\n"
+                f"           incomplete (e.g. EEF state missing from extra dict).\n"
+                f"           Check the stderr output from robomme_env.py for the\n"
+                f"           exact extra keys and update _extract_native_maniskill_obs.\n"
+                f"           Skipping BC warm-start — training from random init."
+            )
+        else:
+            model.policy.load_state_dict(bc_model.policy.state_dict())
+            print("[train_ppo] BC policy weights loaded")
         del bc_model
-        print("[train_ppo] BC policy weights loaded")
 
     wandb_run = None
     if os.environ.get("WANDB_API_KEY"):

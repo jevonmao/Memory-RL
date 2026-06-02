@@ -121,12 +121,14 @@ def _extract_native_maniskill_obs(obs: Dict[str, Any]) -> Dict[str, List[np.ndar
         eef_state     (6,)  — TCP [x, y, z, roll, pitch, yaw]
 
     ManiSkill provides them as:
-        obs["agent"]["qpos"]        shape (9,): first 7 arm, last 2 finger
-        obs["extra"]["tcp_pose"]    shape (7,): [x, y, z, qw, qx, qy, qz]
+        obs["agent"]["qpos"]       shape (9,): first 7 arm, last 2 finger
+        obs["extra"]["tcp_pose"]   shape (7,): [x, y, z, qw, qx, qy, qz]
+          (or possibly a nested dict {"p": (3,), "q": (4,)})
 
     Returns a dict with _list keys so _FlattenLatestObs._vec can process it
     identically to the DemonstrationWrapper-wrapped obs format.
     """
+    import sys as _sys
     result: Dict[str, List[np.ndarray]] = {}
 
     # ---- joint + gripper from agent.qpos ---------------------------------
@@ -138,25 +140,80 @@ def _extract_native_maniskill_obs(obs: Dict[str, Any]) -> Dict[str, List[np.ndar
         result["joint_state_list"]   = [q[:7]  if len(q) >= 7 else np.zeros(7,  np.float32)]
         result["gripper_state_list"] = [q[7:9] if len(q) >= 9 else np.zeros(2, np.float32)]
 
-    # ---- eef state from extra.tcp_pose -----------------------------------
+    # ---- eef state from extra -------------------------------------------
     extra = obs.get("extra", {})
     if not isinstance(extra, dict):
         extra = vars(extra) if hasattr(extra, "__dict__") else {}
 
     tcp = None
-    for key in ("tcp_pose", "eef_pose", "end_effector_pose", "eef_state"):
+    tcp_source = None
+
+    # Try common key names; also handle nested {"p": pos, "q": quat} dicts
+    for key in ("tcp_pose", "eef_pose", "end_effector_pose", "eef_state",
+                "hand_pose", "ee_pos", "tcp"):
         val = extra.get(key)
-        if val is not None:
-            tcp = np.asarray(val).flatten().astype(np.float32)
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            p = val.get("p") or val.get("pos") or val.get("position")
+            q = val.get("q") or val.get("quat") or val.get("quaternion")
+            if p is not None and q is not None:
+                tcp = np.concatenate([
+                    np.asarray(p).flatten(), np.asarray(q).flatten()
+                ]).astype(np.float32)
+                tcp_source = f"extra['{key}'].p+q"
+        else:
+            arr = np.asarray(val).flatten().astype(np.float32)
+            # Skip scalar / very small arrays
+            if len(arr) >= 3:
+                tcp = arr
+                tcp_source = f"extra['{key}'] shape={arr.shape}"
+        if tcp is not None:
             break
 
-    if tcp is not None:
+    # If still missing, scan extra for any (6,) or (7,) shaped array
+    if tcp is None and extra:
+        for key, val in extra.items():
+            if key in ("sensor_data", "sensor_param"):
+                continue
+            try:
+                arr = np.asarray(val).flatten().astype(np.float32)
+                if len(arr) in (6, 7):
+                    tcp = arr
+                    tcp_source = f"extra['{key}'] (auto-detected, shape={arr.shape})"
+                    break
+            except Exception:
+                continue
+
+    if tcp is None:
+        # Log once so the user knows which extra keys exist
+        _sys.stderr.write(
+            f"[robomme] WARNING: could not find EEF state in extra.\n"
+            f"  extra keys: {list(extra.keys())}\n"
+            f"  obs_dim will be 9 instead of 15 — BC checkpoint load will fail.\n"
+            f"  Hint: check extra key names and update _extract_native_maniskill_obs.\n"
+        )
+        _sys.stderr.flush()
+    else:
         if len(tcp) == 7:
-            # ManiSkill standard: [x, y, z, qw, qx, qy, qz]
             pos = tcp[:3]
             rpy = _quat_to_rpy(float(tcp[3]), float(tcp[4]),
                                 float(tcp[5]), float(tcp[6]))
-            eef = np.concatenate([pos, rpy])
+            eef = np.concatenate([pos, rpy]).astype(np.float32)
+        elif len(tcp) == 16:
+            mat = tcp.reshape(4, 4)
+            pos = mat[:3, 3]
+            rot = mat[:3, :3]
+            sy = float(np.sqrt(rot[0, 0] ** 2 + rot[1, 0] ** 2))
+            if sy > 1e-6:
+                roll  = np.arctan2(rot[2, 1], rot[2, 2])
+                pitch = np.arctan2(-rot[2, 0], sy)
+                yaw   = np.arctan2(rot[1, 0], rot[0, 0])
+            else:
+                roll  = np.arctan2(-rot[1, 2], rot[1, 1])
+                pitch = np.arctan2(-rot[2, 0], sy)
+                yaw   = 0.0
+            eef = np.array([pos[0], pos[1], pos[2], roll, pitch, yaw], np.float32)
         elif len(tcp) >= 6:
             eef = tcp[:6]
         else:
