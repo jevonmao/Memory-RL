@@ -19,13 +19,14 @@ env_kwargs:
     - eef_state_list        # (6,)  end-effector pos + rpy
     - joint_state_list      # (7,)  joint positions
     - gripper_state_list    # (2,)  gripper state
-  episode_kwargs: {}
-  # builder_kwargs are forwarded directly to BenchmarkEnvBuilder().
-  # robot_uids overrides the robot recorded in each episode.
-  # panda_wristcam is the recorded robot but mplib has no URDF for it;
-  # panda has identical kinematics and a valid URDF, so the trajectory
-  # replays correctly while avoiding the mplib segfault.
-  builder_kwargs: {robot_uids: panda}
+  # episode_kwargs are forwarded as **kwargs to make_env_for_episode() and
+  # then to gym.make(). robot_uids overrides the robot recorded in each demo.
+  # panda_wristcam (recorded robot) has no mplib URDF → segfault in
+  # DemonstrationWrapper → PandaMotionPlanner → mplib.Planner.__init__.
+  # panda has identical kinematics and a valid mplib URDF.
+  episode_kwargs: {robot_uids: panda}
+  # builder_kwargs are forwarded to BenchmarkEnvBuilder() — does NOT accept robot_uids.
+  builder_kwargs: {}
   subtask_reward: 1.0       # +1 per sub-task completed (0.0 to disable)
   step_penalty: 0.005       # subtracted every non-terminal step; kept small so completing at max_steps
                             # still beats failing: e.g. 7-task BinFill: 8.0 reward − 600×0.005 = +5.0
