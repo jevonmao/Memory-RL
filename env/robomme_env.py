@@ -64,10 +64,19 @@ _ACTION_DIMS = {
 }
 
 class _ManiSkillNoiseFilter(logging.Filter):
-    """Block known informational warnings that survive setLevel resets."""
+    """Block known informational warnings that survive setLevel resets.
+
+    Attached to both the 'mani_skill' logger and the root logger.
+    The root attachment is the reliable one: make_env_for_episode() clears
+    the child logger's filter list on every call, but mani_skill records
+    still propagate to root (propagate=True is the default), where this
+    filter catches them before any handler emits them.
+    """
     _PATTERNS = ("panda_wristcam",)
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if not record.name.startswith("mani_skill"):
+            return True
         return not any(p in record.getMessage() for p in self._PATTERNS)
 
 
@@ -75,19 +84,28 @@ _MANI_SKILL_NOISE_FILTER = _ManiSkillNoiseFilter()
 
 
 def _suppress_mani_skill_noise() -> None:
-    """Set ERROR level and attach a filter on the mani_skill logger.
+    """Suppress mani_skill noise on both the child logger and the root logger.
 
-    Called at import time and again before every make_env_for_episode() call,
-    because ManiSkill resets the logger level during env construction.
-    The filter is idempotent — it is added at most once.
+    Called at import time and before every make_env_for_episode() call.
+    Idempotent — each filter is added at most once.
     """
-    logger = logging.getLogger("mani_skill")
-    logger.setLevel(logging.ERROR)
-    if _MANI_SKILL_NOISE_FILTER not in logger.filters:
-        logger.addFilter(_MANI_SKILL_NOISE_FILTER)
+    child = logging.getLogger("mani_skill")
+    child.setLevel(logging.ERROR)
+    if _MANI_SKILL_NOISE_FILTER not in child.filters:
+        child.addFilter(_MANI_SKILL_NOISE_FILTER)
+
+    root = logging.getLogger()
+    if _MANI_SKILL_NOISE_FILTER not in root.filters:
+        root.addFilter(_MANI_SKILL_NOISE_FILTER)
 
 
 _suppress_mani_skill_noise()
+
+# Reconstruct the ManiSkill physics context every N episodes rather than every
+# reset. Each reconstruction loads a new episode config (object layout) from
+# the demo dataset. N=10 gives ~200 distinct configs over a 10 M-step run
+# while cutting reconstruction overhead by 10x.
+_EPISODE_RELOAD_FREQ = 10
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +248,7 @@ class RoboMMEEnv(gym.Env):
         self._inner = None          # raw ManiSkill env (unwrapped)
         self._prev_task_index = 0
         self._step_count = 0
+        self._reset_count = 0
 
         self._backend, self._builder, _gym_env = self._init_backend(allow_gym_fallback)
 
@@ -419,15 +438,21 @@ class RoboMMEEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         self._prev_task_index = 0
         self._step_count = 0
+        self._reset_count += 1
 
         if self._backend != "robomme":
             return self._inner.reset(seed=seed, options=options)
 
-        ep = self._select_episode(seed)
-        self._inner = self._open_episode_env(ep)
+        if self._reset_count % _EPISODE_RELOAD_FREQ == 0:
+            ep = self._select_episode(seed)
+            self._inner = self._open_episode_env(ep)
+            info = {"episode_idx": ep}
+        else:
+            info = {}
+
         self._inner.reset()         # initialise physics + FK
         obs = self._obs_from_sapien()
-        return obs, {"episode_idx": ep}
+        return obs, info
 
     def step(self, action):
         if self._backend != "robomme":
