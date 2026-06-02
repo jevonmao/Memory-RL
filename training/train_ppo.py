@@ -42,28 +42,41 @@ def _require_sb3():
 
 def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
                   Monitor, DummyVecEnv, SubprocVecEnv, *, force_dummy=False):
-    from env.robomme_env import make_env
+    # Capture repo root here (parent process) so each subprocess can add it
+    # to sys.path. With spawn, sys.path is NOT inherited from the parent.
+    repo_root = str(Path(__file__).resolve().parents[1])
 
     def _thunk(rank: int):
         def _f():
-            env = make_env(
-                task_name, seed=seed + rank,
-                allow_gym_fallback=allow_gym_fallback,
-                env_kwargs=env_kwargs,
+            # With spawn each subprocess starts as a fresh Python interpreter.
+            # Add the repo root so env.robomme_env (a local module, not an
+            # installed package) can be imported. cloudpickle serialises
+            # module-level functions by reference, so the import must succeed
+            # in the subprocess before make_env can be reconstructed.
+            import sys
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            from env.robomme_env import make_env as _make_env       # type: ignore
+            from stable_baselines3.common.monitor import Monitor as _Monitor
+            return _Monitor(
+                _make_env(
+                    task_name, seed=seed + rank,
+                    allow_gym_fallback=allow_gym_fallback,
+                    env_kwargs=env_kwargs,
+                )
             )
-            return Monitor(env)
         return _f
 
     fns = [_thunk(i) for i in range(n_envs)]
     if force_dummy or n_envs == 1:
         return DummyVecEnv(fns)
-    # fork is safe here because set_global_seed() (which calls
-    # torch.cuda.manual_seed_all and initializes CUDA) is called AFTER
-    # _make_vec_env() in main(). Forking before CUDA init lets each subprocess
-    # initialize CUDA independently via ManiSkill/SAPIEN.
-    import platform
-    start_method = "fork" if platform.system() == "Linux" else None
-    return SubprocVecEnv(fns, start_method=start_method)
+    # spawn is required — fork is permanently broken when torch (and therefore
+    # torch.cuda) is imported in the parent process. torch/cuda/__init__.py sets
+    # _original_pid = os.getpid() at import time; every forked child has a
+    # different PID, so _lazy_init() raises "Cannot re-initialize CUDA in forked
+    # subprocess" the first time ManiSkill/SAPIEN calls any CUDA API, regardless
+    # of whether CUDA was explicitly used in the parent.
+    return SubprocVecEnv(fns, start_method="spawn")
 
 
 def _run_post_eval(model, cfg, env_kwargs, run_dir):
@@ -139,6 +152,7 @@ def main():
 
     PPO, CheckpointCallback, EvalCallback, Monitor, DummyVecEnv, SubprocVecEnv = _require_sb3()
 
+    set_global_seed(cfg["seed"], deterministic=cfg.get("deterministic_torch", False))
     run_dir = build_run_dir(cfg["output_dir"], cfg["task_name"], cfg["seed"], tag=args.tag)
     save_run_config(run_dir, cfg)
 
@@ -173,13 +187,6 @@ def main():
         cfg.get("allow_gym_fallback", False), eval_env_kwargs,
         Monitor, DummyVecEnv, SubprocVecEnv, force_dummy=True,
     )
-
-    # Set global seed AFTER forking the vec envs. torch.cuda.manual_seed_all()
-    # initializes the CUDA context in the parent process; if called before fork,
-    # child processes inherit a half-initialized CUDA state and crash when
-    # ManiSkill/SAPIEN tries to use it. Forking first lets each subprocess
-    # initialize CUDA independently.
-    set_global_seed(cfg["seed"], deterministic=cfg.get("deterministic_torch", False))
 
     model = PPO(
         policy=cfg.get("policy", "MlpPolicy"),
