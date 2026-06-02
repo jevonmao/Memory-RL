@@ -104,12 +104,79 @@ class EnvMetadata:
     extra: Dict[str, Any]
 
 
+def _quat_to_rpy(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """Convert [qw, qx, qy, qz] quaternion to [roll, pitch, yaw] in radians."""
+    roll  = np.arctan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+    pitch = np.arcsin(np.clip(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
+    yaw   = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
+def _extract_native_maniskill_obs(obs: Dict[str, Any]) -> Dict[str, List[np.ndarray]]:
+    """Convert native ManiSkill obs (agent/extra/…) to the RoboMME _list format.
+
+    The H5 demo dataset records exactly these three state signals:
+        joint_state   (7,)  — arm joint positions
+        gripper_state (2,)  — finger joint positions
+        eef_state     (6,)  — TCP [x, y, z, roll, pitch, yaw]
+
+    ManiSkill provides them as:
+        obs["agent"]["qpos"]        shape (9,): first 7 arm, last 2 finger
+        obs["extra"]["tcp_pose"]    shape (7,): [x, y, z, qw, qx, qy, qz]
+
+    Returns a dict with _list keys so _FlattenLatestObs._vec can process it
+    identically to the DemonstrationWrapper-wrapped obs format.
+    """
+    result: Dict[str, List[np.ndarray]] = {}
+
+    # ---- joint + gripper from agent.qpos ---------------------------------
+    agent = obs.get("agent", {})
+    qpos_raw = (agent.get("qpos") if isinstance(agent, dict)
+                else getattr(agent, "qpos", None))
+    if qpos_raw is not None:
+        q = np.asarray(qpos_raw).flatten().astype(np.float32)
+        result["joint_state_list"]   = [q[:7]  if len(q) >= 7 else np.zeros(7,  np.float32)]
+        result["gripper_state_list"] = [q[7:9] if len(q) >= 9 else np.zeros(2, np.float32)]
+
+    # ---- eef state from extra.tcp_pose -----------------------------------
+    extra = obs.get("extra", {})
+    if not isinstance(extra, dict):
+        extra = vars(extra) if hasattr(extra, "__dict__") else {}
+
+    tcp = None
+    for key in ("tcp_pose", "eef_pose", "end_effector_pose", "eef_state"):
+        val = extra.get(key)
+        if val is not None:
+            tcp = np.asarray(val).flatten().astype(np.float32)
+            break
+
+    if tcp is not None:
+        if len(tcp) == 7:
+            # ManiSkill standard: [x, y, z, qw, qx, qy, qz]
+            pos = tcp[:3]
+            rpy = _quat_to_rpy(float(tcp[3]), float(tcp[4]),
+                                float(tcp[5]), float(tcp[6]))
+            eef = np.concatenate([pos, rpy])
+        elif len(tcp) >= 6:
+            eef = tcp[:6]
+        else:
+            eef = np.concatenate([tcp, np.zeros(6 - len(tcp), np.float32)])
+        result["eef_state_list"] = [eef.astype(np.float32)]
+
+    return result
+
+
 class _FlattenLatestObs:
     """Take the last item of each list-valued obs key and concatenate numeric ones.
 
     Produces a single float32 vector observation + a Box space. Image keys
     (`*_rgb_list`, `*_depth_list`, `maniskill_obs`) are skipped; if you need
     pixels, set `flatten_obs=False` and provide a custom policy.
+
+    Handles three obs formats in priority order:
+      1. RoboMME _list format:  {"eef_state_list": [arr], ...}
+      2. RoboMME bare format:   {"eef_state": arr, ...}
+      3. Native ManiSkill:      {"agent": {"qpos": ...}, "extra": {"tcp_pose": ...}}
     """
 
     def __init__(self, keys: Sequence[str] = _DEFAULT_FLATTEN_KEYS):
@@ -120,21 +187,36 @@ class _FlattenLatestObs:
         parts: List[np.ndarray] = []
         for k in self.keys:
             v = obs.get(k)
-            # Fall back to the base name without the _list suffix so this works
-            # whether the env returns the DemonstrationWrapper-wrapped list format
-            # ("eef_state_list") or the native BinFill/ManiSkill format ("eef_state").
+            # Try without _list suffix (DemonstrationWrapper-stripped format)
             if v is None and k.endswith("_list"):
                 v = obs.get(k[:-5])
             if v is None:
                 continue
             arr = np.asarray(v[-1] if isinstance(v, (list, tuple)) else v).astype(np.float32).flatten()
             parts.append(arr)
-        if not parts:
-            raise RuntimeError(
-                f"None of the requested keys {self.keys} were present in obs. "
-                f"Obs keys present: {list(obs.keys())}"
-            )
-        return np.concatenate(parts, axis=0)
+
+        if parts:
+            return np.concatenate(parts, axis=0)
+
+        # Native ManiSkill obs: agent.qpos + extra.tcp_pose → joint/gripper/eef
+        if "agent" in obs:
+            converted = _extract_native_maniskill_obs(obs)
+            if converted:
+                # Re-run through normal path now that keys exist
+                parts2: List[np.ndarray] = []
+                for k in self.keys:
+                    v = converted.get(k) or converted.get(k[:-5] if k.endswith("_list") else k)
+                    if v is None:
+                        continue
+                    arr = np.asarray(v[-1] if isinstance(v, (list, tuple)) else v).astype(np.float32).flatten()
+                    parts2.append(arr)
+                if parts2:
+                    return np.concatenate(parts2, axis=0)
+
+        raise RuntimeError(
+            f"None of the requested keys {self.keys} were present in obs. "
+            f"Obs keys present: {list(obs.keys())}"
+        )
 
     def transform(self, obs: Dict[str, Any]) -> np.ndarray:
         v = self._vec(obs)
