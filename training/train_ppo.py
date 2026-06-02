@@ -57,11 +57,12 @@ def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
     fns = [_thunk(i) for i in range(n_envs)]
     if force_dummy or n_envs == 1:
         return DummyVecEnv(fns)
-    # fork is much faster than spawn on Linux (no need to re-import everything).
-    # Falls back to the OS default (spawn) on macOS / Windows.
-    import platform
-    start_method = "fork" if platform.system() == "Linux" else None
-    return SubprocVecEnv(fns, start_method=start_method)
+    # ManiSkill/SAPIEN initializes CUDA in each env subprocess. fork() inherits
+    # the parent's CUDA context and cannot re-initialize it, causing a crash.
+    # spawn starts fresh subprocesses with no inherited CUDA state, which is
+    # required whenever CUDA is used in the parent before the fork (e.g. from
+    # set_global_seed → torch.cuda.manual_seed_all, or BC checkpoint loading).
+    return SubprocVecEnv(fns, start_method="spawn")
 
 
 def _run_post_eval(model, cfg, env_kwargs, run_dir):
