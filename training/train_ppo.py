@@ -166,7 +166,12 @@ def _load_bc_weights_zero_padded(ppo_policy, bc_policy) -> None:
 
     new_sd = {}
     for k, v in bc_sd.items():
-        if v.ndim == 2 and v.shape[1] == bc_obs_dim:
+        if k == "log_std":
+            # BC trains a tight (low-std) distribution to imitate experts precisely.
+            # Copying that log_std into PPO kills exploration before training starts.
+            # Always use PPO's log_std_init instead.
+            new_sd[k] = ppo_sd[k]
+        elif v.ndim == 2 and v.shape[1] == bc_obs_dim:
             # Input-layer weight: zero-pad new columns
             new_w = torch.zeros(v.shape[0], ppo_obs_dim, dtype=v.dtype)
             new_w[:, :bc_obs_dim] = v
@@ -370,6 +375,14 @@ def main():
     )
 
     bc_checkpoint = args.bc_checkpoint or cfg.get("bc_checkpoint")
+    import torch as _torch
+    log_std_init = float(
+        (cfg.get("policy_kwargs") or {}).get("log_std_init", 0.0)
+    )
+    print(f"[train_ppo] log_std_init={log_std_init}  "
+          f"initial action std={_torch.exp(_torch.tensor(log_std_init)).item():.3f}  "
+          f"BC checkpoint={'yes: ' + str(bc_checkpoint) if bc_checkpoint else 'no (random init)'}")
+
     if bc_checkpoint:
         bc_path = Path(bc_checkpoint)
         if not bc_path.exists():
@@ -381,12 +394,16 @@ def main():
         mode = _bc_compat(model.policy, bc_model.policy)
         if mode == "exact":
             model.policy.load_state_dict(bc_model.policy.state_dict())
-            print("[train_ppo] BC policy weights loaded (exact match)")
+            # BC log_std was overwritten above; restore PPO's init value.
+            with _torch.no_grad():
+                model.policy.log_std.fill_(log_std_init)
+            print("[train_ppo] BC policy weights loaded (exact match); log_std reset to init")
         elif mode == "zero_pad":
             _load_bc_weights_zero_padded(model.policy, bc_model.policy)
+            # _load_bc_weights_zero_padded already skips log_std, so PPO init is preserved.
             print(f"[train_ppo] BC policy weights loaded with zero-padding "
                   f"({bc_obs_shape[0]}-D → {ppo_obs_shape[0]}-D obs); "
-                  f"new object-state columns initialised to zero")
+                  f"log_std kept at init ({log_std_init:.2f}, std={_torch.exp(_torch.tensor(log_std_init)).item():.3f})")
         else:
             print(
                 f"[train_ppo] WARNING: BC checkpoint architecture is incompatible "
