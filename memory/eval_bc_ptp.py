@@ -1,11 +1,7 @@
 import torch
 import numpy as np
-from pathlib import Path
 
 from .model import SimpleVLA
-from .dataset import RoboVLAPTPDataset  # only for preprocessing helpers if needed
-
-# IMPORTANT: use your real env
 from env.robomme_env import make_env
 
 
@@ -22,24 +18,65 @@ def load_model(checkpoint_path, device):
 
 
 # -----------------------------
-# Policy wrapper
+# Action selection
 # -----------------------------
 @torch.no_grad()
-def select_action(model, history_states, history_images, device):
-    """
-    history_states: (T, state_dim)
-    history_images: (T, C, H, W)
-    """
-
-    states = torch.tensor(history_states, dtype=torch.float32).unsqueeze(0).to(device)
-    images = torch.tensor(history_images, dtype=torch.float32).unsqueeze(0).to(device)
+def select_action(model, states, images, device):
+    states = torch.tensor(states, dtype=torch.float32).unsqueeze(0).to(device)
+    images = torch.tensor(images, dtype=torch.float32).unsqueeze(0).to(device)
 
     action, _, _ = model(states, images)
     return action.squeeze(0).cpu().numpy()
 
 
 # -----------------------------
-# Evaluation loop
+# Observation parsing (ROBUST)
+# -----------------------------
+def parse_obs(obs):
+    """
+    Tries to robustly extract:
+    - state vector (D,)
+    - image (3,H,W)
+    """
+
+    if isinstance(obs, dict):
+        # Try common keys
+        if "state" in obs:
+            state = obs["state"]
+        elif "agent" in obs:
+            state = obs["agent"]
+        elif "proprio" in obs:
+            state = obs["proprio"]
+        else:
+            raise KeyError(f"Unknown state keys: {obs.keys()}")
+
+        if "image" in obs:
+            image = obs["image"]
+        elif "rgb" in obs:
+            image = obs["rgb"]
+        else:
+            image = np.zeros((64, 64, 3), dtype=np.float32)
+
+    else:
+        state = obs
+        image = np.zeros((64, 64, 3), dtype=np.float32)
+
+    # -------------------------
+    # Fix image format
+    # -------------------------
+    image = np.asarray(image)
+
+    if image.ndim == 3 and image.shape[-1] == 3:
+        # HWC → CHW
+        image = np.transpose(image, (2, 0, 1))
+    elif image.ndim != 3:
+        raise ValueError(f"Unexpected image shape: {image.shape}")
+
+    return np.asarray(state), image
+
+
+# -----------------------------
+# Evaluation
 # -----------------------------
 def evaluate(
     task="PickXtimes",
@@ -47,10 +84,11 @@ def evaluate(
     episodes=20,
     history_len=8,
 ):
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
 
     model = load_model(checkpoint, device)
-
     env = make_env(task)
 
     success_count = 0
@@ -59,47 +97,52 @@ def evaluate(
     for ep in range(episodes):
 
         obs, info = env.reset(seed=ep)
+        state, image = parse_obs(obs)
 
-        history_states = []
-        history_images = []
+        # -------------------------
+        # FIXED HISTORY INIT
+        # -------------------------
+        history_states = [state] * history_len
+        history_images = [image] * history_len
 
         done = False
         total_reward = 0
 
+        step = 0
+
         while not done:
 
-            # ---------------------------------
-            # build history window
-            # ---------------------------------
-            if len(history_states) < history_len:
-                pad_state = np.zeros_like(history_states[-1]) if history_states else np.zeros(15)
-                pad_img = np.zeros((3, 64, 64))
+            hs = np.stack(history_states[-history_len:])
+            hi = np.stack(history_images[-history_len:])
 
-                while len(history_states) < history_len:
-                    history_states.insert(0, pad_state)
-                    history_images.insert(0, pad_img)
+            # -------------------------
+            # DEBUG (lightweight)
+            # -------------------------
+            if step == 0:
+                print(f"\n[Episode {ep}]")
+                print("state shape:", state.shape)
+                print("image shape:", image.shape)
+                print("history state shape:", hs.shape)
+                print("history image shape:", hi.shape)
 
-            hs = np.array(history_states[-history_len:])
-            hi = np.array(history_images[-history_len:])
-
-            # ---------------------------------
-            # policy action
-            # ---------------------------------
             action = select_action(model, hs, hi, device)
+
+            # DEBUG: action sanity check
+            if step == 0:
+                print("action sample:", action)
 
             obs, reward, term, trunc, info = env.step(action)
             done = term or trunc
 
             total_reward += reward
 
-            # ---------------------------------
-            # update history
-            # ---------------------------------
-            state = obs["state"] if isinstance(obs, dict) else obs
-            image = obs["image"] if isinstance(obs, dict) else np.zeros((3, 64, 64))
+            # update obs
+            state, image = parse_obs(obs)
 
             history_states.append(state)
             history_images.append(image)
+
+            step += 1
 
         success = info.get("success", False)
 
@@ -111,7 +154,3 @@ def evaluate(
     print("\n===== FINAL RESULTS =====")
     print(f"Success rate: {success_count / episodes:.3f}")
     print(f"Avg return: {np.mean(returns):.3f}")
-
-
-if __name__ == "__main__":
-    evaluate()
