@@ -361,6 +361,7 @@ def main():
         ent_coef=cfg["ent_coef"],
         vf_coef=cfg["vf_coef"],
         max_grad_norm=cfg["max_grad_norm"],
+        target_kl=cfg.get("target_kl", None),
         tensorboard_log=str(run_dir / "tb"),
         seed=cfg["seed"],
         device=cfg.get("device", "auto"),

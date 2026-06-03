@@ -36,15 +36,17 @@ env_kwargs:
 #              8192 steps / 600 max_steps ≈ 13 complete episodes per update  (good diversity)
 #              each env sees ~1.7 complete episodes per rollout  (good advantage estimation)
 # train_ppo.py auto-adjusts batch_size downward if it doesn't divide rollout evenly.
-learning_rate: 1.0e-4       # reduced from 3e-4: clip_fraction 0.43-0.51 and approx_kl 0.05-0.08 indicate updates too aggressive
+learning_rate: 1.0e-4       # reduced from 3e-4; high clip_fraction indicates updates still aggressive
 n_steps: 1024               # steps per env per update; 8×1024=8192 covers ~13 BinFill episodes
 batch_size: 1024            # 8192/1024 = 8 minibatches; must divide n_envs×n_steps exactly
-n_epochs: 4                 # PPO reuse epochs per rollout; reduce to 4 if approx_kl > 0.02
+n_epochs: 4                 # PPO reuse epochs; target_kl stops early when needed
 gamma: 0.99                 # discount; effective horizon ≈ 1/(1-γ) = 100 steps, fine for max_steps=600
 gae_lambda: 0.95            # GAE λ; high bias–variance trade-off standard
-clip_range: 0.2             # PPO clip ε; standard starting point; reduce to 0.1 if unstable
-ent_coef: 0.05              # entropy bonus; raised from 0.01 — manipulation with sparse reward
-                            # needs more exploration pressure to avoid premature convergence
+clip_range: 0.2             # PPO clip ε
+target_kl: 0.05             # early-stop n_epochs if KL exceeds this — prevents the std 1.0→0.09
+                            # collapse seen on iteration 2 (approx_kl=21.78 without this guard)
+ent_coef: 0.1               # raised from 0.05: std collapsed to 0.09 in first rollout;
+                            # stronger entropy bonus needed to resist all-negative-reward pressure
 vf_coef: 0.5                # value loss weight; standard
 max_grad_norm: 0.5          # gradient clipping; standard for PPO
 
