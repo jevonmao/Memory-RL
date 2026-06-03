@@ -116,8 +116,11 @@ def evaluate(
 
         # 🔥 DEBUG: dump obs structure ONCE
         if ep == 0:
-            print("\n===== OBS KEYS =====")
-            print(obs.keys())
+            print("\n===== OBS DEBUG =====")
+            print("type:", type(obs))
+            print("shape:", getattr(obs, "shape", None))
+            print("dtype:", getattr(obs, "dtype", None))
+            print("first 10 values:", obs[:10])
 
         state, image = parse_obs(obs)
 
