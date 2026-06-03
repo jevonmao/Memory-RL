@@ -12,15 +12,11 @@ from torch.utils.data import Dataset
 OBS_KEYS = ("eef_state", "joint_state", "gripper_state")
 ACTION_KEY = "joint_action"
 
-IMAGE_KEYS = (
-    "front_rgb",
-    "wrist_rgb",
-)
+IMAGE_KEYS = ("front_rgb", "wrist_rgb")
 
 # --------------------------------------------------
 # Helpers
 # --------------------------------------------------
-
 
 def _timestep_index(name: str) -> int:
     return int(name.split("_")[-1])

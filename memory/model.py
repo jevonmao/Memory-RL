@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from memory import MemoryModule
+from .memory import MemoryModule
 
 # --------------------------------------------------
 # Global Hyperparameters
