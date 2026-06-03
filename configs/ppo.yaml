@@ -45,8 +45,8 @@ gae_lambda: 0.95            # GAE λ; high bias–variance trade-off standard
 clip_range: 0.2             # PPO clip ε
 target_kl: 0.05             # early-stop n_epochs if KL exceeds this — prevents the std 1.0→0.09
                             # collapse seen on iteration 2 (approx_kl=21.78 without this guard)
-ent_coef: 0.1               # raised from 0.05: std collapsed to 0.09 in first rollout;
-                            # stronger entropy bonus needed to resist all-negative-reward pressure
+ent_coef: 0.3               # raised from 0.1: std still collapses to 0.09 in epoch 1 because
+                            # all-negative rewards overwhelm the entropy gradient; 0.3 needed to resist
 vf_coef: 0.5                # value loss weight; standard
 max_grad_norm: 0.5          # gradient clipping; standard for PPO
 
@@ -83,5 +83,6 @@ policy: MlpPolicy
 # log_std_init is PPO-only (no effect on BC supervised loss).
 policy_kwargs:
   net_arch: [256, 256]      # standard for manipulation; default [64,64] is too small for 15+N-D obs
-  log_std_init: 0.0         # std=1.0 at init; explicit to prevent entropy collapse
+  log_std_init: 0.5         # std=exp(0.5)≈1.65 at init; higher start means more headroom before
+                            # first-epoch collapse drives std below usable exploration range
 device: cpu                 # MlpPolicy runs faster on CPU; GPU is reserved for SAPIEN physics
