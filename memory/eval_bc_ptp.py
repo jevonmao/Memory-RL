@@ -105,7 +105,8 @@ def evaluate(
     print(f"[INFO] Using device: {device}")
 
     model = load_model(checkpoint, device)
-    env = make_env(task)
+    # env = make_env(task)
+    env = make_env(task, env_kwargs={"flatten_obs": False})
 
     success_count = 0
     returns = []
@@ -116,11 +117,8 @@ def evaluate(
 
         # 🔥 DEBUG: dump obs structure ONCE
         if ep == 0:
-            print("\n===== OBS DEBUG =====")
-            print("type:", type(obs))
-            print("shape:", getattr(obs, "shape", None))
-            print("dtype:", getattr(obs, "dtype", None))
-            print("first 10 values:", obs[:10])
+            print(type(obs))
+            print(obs.keys())
 
         state, image = parse_obs(obs)
 
