@@ -30,49 +30,65 @@ def select_action(model, states, images, device):
 
 
 # -----------------------------
-# Observation parsing (ROBUST)
+# 🔥 ROBUST OBS PARSING (FIXED)
 # -----------------------------
+def extract_state(obs):
+    """
+    Build 1D state vector from RoboMME dict.
+    """
+
+    if not isinstance(obs, dict):
+        return np.asarray(obs, dtype=np.float32)
+
+    parts = []
+
+    for k in ["eef_state_list", "joint_state_list", "gripper_state_list"]:
+        if k in obs:
+            v = obs[k]
+            v = v[-1] if isinstance(v, (list, tuple)) else v
+            parts.append(np.asarray(v).flatten())
+
+    if len(parts) == 0:
+        raise KeyError(f"[State] No valid keys in obs: {list(obs.keys())}")
+
+    return np.concatenate(parts).astype(np.float32)
+
+
+def extract_image(obs):
+    """
+    Extract RGB image in CHW format.
+    """
+
+    if not isinstance(obs, dict):
+        return np.zeros((3, 64, 64), dtype=np.float32)
+
+    # try common RoboMME camera keys
+    for k in [
+        "front_rgb_list",
+        "rgb_list",
+        "camera_rgb_list",
+        "image",
+    ]:
+        if k in obs:
+            img = obs[k]
+            img = img[-1] if isinstance(img, (list, tuple)) else img
+            img = np.asarray(img)
+
+            # HWC → CHW
+            if img.ndim == 3 and img.shape[-1] == 3:
+                img = np.transpose(img, (2, 0, 1))
+
+            img = img.astype(np.float32)
+
+            return img
+
+    # fallback (IMPORTANT: avoid silent failure)
+    print("[WARN] No image found in obs keys:", obs.keys())
+    return np.zeros((3, 64, 64), dtype=np.float32)
+
+
 def parse_obs(obs):
-    """
-    Tries to robustly extract:
-    - state vector (D,)
-    - image (3,H,W)
-    """
-
-    if isinstance(obs, dict):
-        # Try common keys
-        if "state" in obs:
-            state = obs["state"]
-        elif "agent" in obs:
-            state = obs["agent"]
-        elif "proprio" in obs:
-            state = obs["proprio"]
-        else:
-            raise KeyError(f"Unknown state keys: {obs.keys()}")
-
-        if "image" in obs:
-            image = obs["image"]
-        elif "rgb" in obs:
-            image = obs["rgb"]
-        else:
-            image = np.zeros((64, 64, 3), dtype=np.float32)
-
-    else:
-        state = obs
-        image = np.zeros((64, 64, 3), dtype=np.float32)
-
-    # -------------------------
-    # Fix image format
-    # -------------------------
-    image = np.asarray(image)
-
-    if image.ndim == 3 and image.shape[-1] == 3:
-        # HWC → CHW
-        image = np.transpose(image, (2, 0, 1))
-    elif image.ndim != 3:
-        raise ValueError(f"Unexpected image shape: {image.shape}")
-
-    return np.asarray(state), image
+    return extract_state(obs), extract_image(obs)
 
 
 # -----------------------------
@@ -97,18 +113,21 @@ def evaluate(
     for ep in range(episodes):
 
         obs, info = env.reset(seed=ep)
-        state, image = parse_obs(obs)
-        print("initial state:", state[:10])
 
-        # -------------------------
-        # FIXED HISTORY INIT
-        # -------------------------
+        # 🔥 DEBUG: dump obs structure ONCE
+        if ep == 0:
+            print("\n===== OBS KEYS =====")
+            print(obs.keys())
+
+        state, image = parse_obs(obs)
+
+        print("\ninitial state:", state[:10])
+
         history_states = [state] * history_len
         history_images = [image] * history_len
 
         done = False
         total_reward = 0
-
         step = 0
 
         while not done:
@@ -116,9 +135,6 @@ def evaluate(
             hs = np.stack(history_states[-history_len:])
             hi = np.stack(history_images[-history_len:])
 
-            # -------------------------
-            # DEBUG (lightweight)
-            # -------------------------
             if step == 0:
                 print(f"\n[Episode {ep}]")
                 print("state shape:", state.shape)
@@ -128,7 +144,6 @@ def evaluate(
 
             action = select_action(model, hs, hi, device)
 
-            # DEBUG: action sanity check
             if step == 0:
                 print("action sample:", action)
                 print("image min/max:", image.min(), image.max())
@@ -138,10 +153,9 @@ def evaluate(
 
             total_reward += reward
 
-            # update obs
             state, image = parse_obs(obs)
 
-            if step < 10:
+            if step < 5:
                 print(f"step={step}")
                 print("state[:3] =", state[:3])
                 print("action =", action)
@@ -150,11 +164,10 @@ def evaluate(
             history_images.append(image)
 
             step += 1
-        
+
         print("episode length:", step)
 
         success = info.get("success", False)
-
         success_count += int(success)
         returns.append(total_reward)
 
@@ -163,6 +176,7 @@ def evaluate(
     print("\n===== FINAL RESULTS =====")
     print(f"Success rate: {success_count / episodes:.3f}")
     print(f"Avg return: {np.mean(returns):.3f}")
+
 
 if __name__ == "__main__":
     print("=== Starting evaluation ===")
