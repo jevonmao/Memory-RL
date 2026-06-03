@@ -131,6 +131,7 @@ def evaluate(
             # DEBUG: action sanity check
             if step == 0:
                 print("action sample:", action)
+                print("image min/max:", image.min(), image.max())
 
             obs, reward, term, trunc, info = env.step(action)
             done = term or trunc
@@ -140,9 +141,10 @@ def evaluate(
             # update obs
             state, image = parse_obs(obs)
 
-            if step < 5:
+            if step < 10:
                 print(f"step={step}")
-                print("state[:5] =", state[:5])
+                print("state[:3] =", state[:3])
+                print("action =", action)
 
             history_states.append(state)
             history_images.append(image)
