@@ -178,35 +178,97 @@ def _sanitize_info(info: Any) -> Dict[str, Any]:
     return out
 
 
-def _log_native_obs_structure(native_obs) -> None:
-    """Print the structure of ManiSkill's native obs once at env init.
-
-    Helps diagnose whether object-state information is present and what
-    keys/shapes are available for the _raw_obj_obs extraction.
-    """
-    print("[robomme_env] native obs type:", type(native_obs).__name__, flush=True)
+def _log_native_obs_structure(native_obs, indent: int = 0) -> None:
+    """Recursively print the structure of ManiSkill's native obs."""
+    prefix = "  " * indent
     if isinstance(native_obs, dict):
-        for k, v in sorted(native_obs.items()):
+        if indent == 0:
+            print("[robomme_env] native obs (dict):", flush=True)
+        for k in sorted(native_obs.keys()):
+            v = native_obs[k]
             if isinstance(v, dict):
-                print(f"  '{k}': dict with keys:", sorted(v.keys()), flush=True)
-                for k2, v2 in sorted(v.items()):
-                    try:
-                        shape = np.asarray(v2).shape
-                    except Exception:
-                        shape = type(v2).__name__
-                    print(f"    '{k2}': shape={shape}", flush=True)
+                print(f"{prefix}  '{k}': dict keys={sorted(v.keys())}", flush=True)
+                _log_native_obs_structure(v, indent + 1)
             else:
                 try:
-                    shape = np.asarray(v).shape
+                    arr = np.asarray(v)
+                    print(f"{prefix}  '{k}': shape={arr.shape} dtype={arr.dtype}  "
+                          f"sample={arr.flatten()[:4]}", flush=True)
                 except Exception:
-                    shape = type(v).__name__
-                print(f"  '{k}': shape={shape}", flush=True)
+                    print(f"{prefix}  '{k}': {type(v).__name__}", flush=True)
     else:
         try:
             arr = np.asarray(native_obs)
-            print(f"  flat array shape={arr.shape} dtype={arr.dtype}", flush=True)
+            print(f"[robomme_env] native obs: flat array shape={arr.shape} "
+                  f"dtype={arr.dtype}  sample={arr.flatten()[:8]}", flush=True)
         except Exception as e:
-            print(f"  (could not inspect: {e})", flush=True)
+            print(f"[robomme_env] native obs: (could not inspect: {e})", flush=True)
+
+
+def _log_sapien_attributes(env) -> None:
+    """Print SAPIEN physics-sim attributes that could serve as object-state obs."""
+    print("[robomme_env] SAPIEN attribute scan:", flush=True)
+
+    # --- robot state ---
+    try:
+        qpos = np.asarray(env.agent.robot.get_qpos()).flatten()
+        print(f"  agent.robot.get_qpos(): shape={qpos.shape}  val={qpos}", flush=True)
+    except Exception as e:
+        print(f"  agent.robot.get_qpos(): FAILED — {e}", flush=True)
+
+    for tcp_attr in ("tcp_pose", "tcp"):
+        try:
+            tcp = getattr(env.agent, tcp_attr)
+            pose = tcp if hasattr(tcp, "p") else tcp.pose
+            print(f"  agent.{tcp_attr}.p (gripper pos): {np.asarray(pose.p).flatten()}",
+                  flush=True)
+            break
+        except Exception:
+            pass
+
+    # --- cubes ---
+    for attr in ("all_cubes", "red_cubes", "blue_cubes", "green_cubes"):
+        objs = getattr(env, attr, None)
+        if objs is None:
+            print(f"  env.{attr}: NOT PRESENT", flush=True)
+            continue
+        print(f"  env.{attr}: {len(objs)} objects", flush=True)
+        for i, obj in enumerate(objs[:3]):   # show at most 3
+            try:
+                p = np.asarray(obj.pose.p).flatten()
+                q = np.asarray(obj.pose.q).flatten()
+                print(f"    [{i}] pos={p}  quat={q}", flush=True)
+            except Exception as e:
+                print(f"    [{i}] pose read failed: {e}", flush=True)
+
+    # --- bin / goal ---
+    for attr in ("board_with_hole", "bin", "goal", "target"):
+        obj = getattr(env, attr, None)
+        if obj is None:
+            continue
+        try:
+            p = np.asarray(obj.pose.p).flatten()
+            print(f"  env.{attr}.pose.p (bin pos): {p}", flush=True)
+        except Exception as e:
+            print(f"  env.{attr}: pose read failed: {e}", flush=True)
+
+    # --- task progress ---
+    for attr in ("current_task_index", "timestep", "use_demonstrationwrapper",
+                 "red_cubes_in_bin", "blue_cubes_in_bin", "green_cubes_in_bin",
+                 "red_cubes_target_number", "blue_cubes_target_number",
+                 "green_cubes_target_number"):
+        val = getattr(env, attr, "NOT PRESENT")
+        print(f"  env.{attr}: {val}", flush=True)
+
+    # --- button ---
+    for attr in ("button",):
+        obj = getattr(env, attr, None)
+        if obj is not None:
+            try:
+                p = np.asarray(obj.pose.p).flatten()
+                print(f"  env.{attr}.pose.p: {p}", flush=True)
+            except Exception as e:
+                print(f"  env.{attr}: {e}", flush=True)
 
 
 def list_tasks() -> List[str]:
@@ -316,6 +378,7 @@ class RoboMMEEnv(gym.Env):
             )
             self.action_space = _action_space_for(action_space)
             _log_native_obs_structure(_init_native)
+            _log_sapien_attributes(self._inner)
 
         self.metadata_info = EnvMetadata(
             task_name=task_name,

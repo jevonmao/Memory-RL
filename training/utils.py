@@ -35,7 +35,7 @@ def build_run_dir(
     timestamp: Optional[str] = None,
 ) -> Path:
     timestamp = timestamp or _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    parts = [task_name, f"seed{seed}", timestamp]
+    parts = [task_name, f"seed_{seed}", timestamp]
     if tag:
         parts.append(tag)
     run = Path(base) / "_".join(parts)

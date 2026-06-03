@@ -54,6 +54,6 @@ no implementations yet.
 
 ## Conventions
 
-- Run dirs: `logs/<task>_seed<seed>_<timestamp>[_<tag>]/`. Smoke runs use `--tag smoke`.
+- Run dirs: `logs/<task>_seed_<seed>_<timestamp>[_<tag>]/`. Smoke runs use `--tag smoke`.
 - Aggregated results land in `results/<phase>.json` (not yet created).
 - Don't silently substitute Gym for RoboMME — `--allow-gym-fallback` is opt-in.
