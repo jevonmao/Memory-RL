@@ -107,6 +107,23 @@ _suppress_mani_skill_noise()
 # while cutting reconstruction overhead by 20x.
 _EPISODE_RELOAD_FREQ = 20
 
+# Maximum cubes per colour to read from SAPIEN into the observation.
+# This does NOT limit how many cubes SAPIEN spawns — it only caps how many
+# positions appear in the obs vector.  We observed 5 blue cubes in one episode
+# with blue_target=2; using 5 ensures no cube position is silently dropped.
+_MAX_CUBES_PER_COLOR = 5
+
+# Fixed size of the SAPIEN-sourced object-state observation block appended
+# to the 15-D proprioception vector:
+#   _MAX_CUBES_PER_COLOR × 3 × 3   per-colour cube positions
+#                                    (red, blue, green — zero-padded)
+#   3                               bin (board_with_hole) position
+#   3                               button position
+#   3                               target counts  (red / blue / green)
+#   3                               in-bin counts  (red / blue / green)
+#   1                               current_task_index / 13
+_SAPIEN_OBJ_STATE_DIM = (_MAX_CUBES_PER_COLOR * 3 * 3) + 3 + 3 + 3 + 3 + 1  # = 40
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -176,99 +193,6 @@ def _sanitize_info(info: Any) -> Dict[str, Any]:
         except Exception:
             out[k] = v
     return out
-
-
-def _log_native_obs_structure(native_obs, indent: int = 0) -> None:
-    """Recursively print the structure of ManiSkill's native obs."""
-    prefix = "  " * indent
-    if isinstance(native_obs, dict):
-        if indent == 0:
-            print("[robomme_env] native obs (dict):", flush=True)
-        for k in sorted(native_obs.keys()):
-            v = native_obs[k]
-            if isinstance(v, dict):
-                print(f"{prefix}  '{k}': dict keys={sorted(v.keys())}", flush=True)
-                _log_native_obs_structure(v, indent + 1)
-            else:
-                try:
-                    arr = np.asarray(v)
-                    print(f"{prefix}  '{k}': shape={arr.shape} dtype={arr.dtype}  "
-                          f"sample={arr.flatten()[:4]}", flush=True)
-                except Exception:
-                    print(f"{prefix}  '{k}': {type(v).__name__}", flush=True)
-    else:
-        try:
-            arr = np.asarray(native_obs)
-            print(f"[robomme_env] native obs: flat array shape={arr.shape} "
-                  f"dtype={arr.dtype}  sample={arr.flatten()[:8]}", flush=True)
-        except Exception as e:
-            print(f"[robomme_env] native obs: (could not inspect: {e})", flush=True)
-
-
-def _log_sapien_attributes(env) -> None:
-    """Print SAPIEN physics-sim attributes that could serve as object-state obs."""
-    print("[robomme_env] SAPIEN attribute scan:", flush=True)
-
-    # --- robot state ---
-    try:
-        qpos = np.asarray(env.agent.robot.get_qpos()).flatten()
-        print(f"  agent.robot.get_qpos(): shape={qpos.shape}  val={qpos}", flush=True)
-    except Exception as e:
-        print(f"  agent.robot.get_qpos(): FAILED — {e}", flush=True)
-
-    for tcp_attr in ("tcp_pose", "tcp"):
-        try:
-            tcp = getattr(env.agent, tcp_attr)
-            pose = tcp if hasattr(tcp, "p") else tcp.pose
-            print(f"  agent.{tcp_attr}.p (gripper pos): {np.asarray(pose.p).flatten()}",
-                  flush=True)
-            break
-        except Exception:
-            pass
-
-    # --- cubes ---
-    for attr in ("all_cubes", "red_cubes", "blue_cubes", "green_cubes"):
-        objs = getattr(env, attr, None)
-        if objs is None:
-            print(f"  env.{attr}: NOT PRESENT", flush=True)
-            continue
-        print(f"  env.{attr}: {len(objs)} objects", flush=True)
-        for i, obj in enumerate(objs[:3]):   # show at most 3
-            try:
-                p = np.asarray(obj.pose.p).flatten()
-                q = np.asarray(obj.pose.q).flatten()
-                print(f"    [{i}] pos={p}  quat={q}", flush=True)
-            except Exception as e:
-                print(f"    [{i}] pose read failed: {e}", flush=True)
-
-    # --- bin / goal ---
-    for attr in ("board_with_hole", "bin", "goal", "target"):
-        obj = getattr(env, attr, None)
-        if obj is None:
-            continue
-        try:
-            p = np.asarray(obj.pose.p).flatten()
-            print(f"  env.{attr}.pose.p (bin pos): {p}", flush=True)
-        except Exception as e:
-            print(f"  env.{attr}: pose read failed: {e}", flush=True)
-
-    # --- task progress ---
-    for attr in ("current_task_index", "timestep", "use_demonstrationwrapper",
-                 "red_cubes_in_bin", "blue_cubes_in_bin", "green_cubes_in_bin",
-                 "red_cubes_target_number", "blue_cubes_target_number",
-                 "green_cubes_target_number"):
-        val = getattr(env, attr, "NOT PRESENT")
-        print(f"  env.{attr}: {val}", flush=True)
-
-    # --- button ---
-    for attr in ("button",):
-        obj = getattr(env, attr, None)
-        if obj is not None:
-            try:
-                p = np.asarray(obj.pose.p).flatten()
-                print(f"  env.{attr}.pose.p: {p}", flush=True)
-            except Exception as e:
-                print(f"  env.{attr}: {e}", flush=True)
 
 
 def list_tasks() -> List[str]:
@@ -371,14 +295,12 @@ class RoboMMEEnv(gym.Env):
             self._inner = self._open_episode_env(self._select_episode(seed))
             _init_result = self._inner.reset()
             _init_native = _init_result[0] if isinstance(_init_result, tuple) else _init_result
-            self._obj_obs_dim = self._discover_obj_obs_dim(_init_native)
+            self._obj_obs_dim = _SAPIEN_OBJ_STATE_DIM  # fixed; built from SAPIEN attributes
             sample_obs = self._obs_from_sapien(_init_native)
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0, shape=sample_obs.shape, dtype=np.float32
             )
             self.action_space = _action_space_for(action_space)
-            _log_native_obs_structure(_init_native)
-            _log_sapien_attributes(self._inner)
 
         self.metadata_info = EnvMetadata(
             task_name=task_name,
@@ -485,16 +407,16 @@ class RoboMMEEnv(gym.Env):
     # -----------------------------------------------------------------------
 
     def _obs_from_sapien(self, native_obs=None) -> np.ndarray:
-        """Return the full observation: proprioception (15-D) + object state (N-D).
+        """Return the full observation: proprioception (15-D) + object state (28-D).
 
-        native_obs is ManiSkill's raw step/reset return value.  When present,
-        its non-agent content is appended as the object-state block.  When None
-        (gymnasium-fallback or unavailable), only the 15-D proprioception is
-        returned.
+        Object state is read directly from SAPIEN physics attributes (cube
+        positions, bin/button positions, task-progress counters) rather than
+        from the native obs dict, whose 'extra' block is empty for BinFill.
+        native_obs is accepted for API compatibility but is not used.
         """
         prop = self._prop_obs_from_sapien()
-        if self._obj_obs_dim > 0 and native_obs is not None:
-            return np.concatenate([prop, self._extract_obj_obs(native_obs)])
+        if self._obj_obs_dim > 0:
+            return np.concatenate([prop, self._sapien_obj_obs()])
         return prop
 
     def _prop_obs_from_sapien(self) -> np.ndarray:
@@ -548,8 +470,86 @@ class RoboMMEEnv(gym.Env):
 
         return np.concatenate([eef_state, joint_state, gripper_state])  # (15,)
 
+    def _sapien_obj_obs(self) -> np.ndarray:
+        """Build the 40-D object-state vector from SAPIEN physics attributes.
+
+        Layout (indices, N = _MAX_CUBES_PER_COLOR = 3):
+          [0   : 9 ]  red_cubes[0..N-1]   positions (x,y,z, zero-padded)
+          [9   : 18]  blue_cubes[0..N-1]  positions
+          [18  : 27]  green_cubes[0..N-1] positions
+          [27  : 30]  board_with_hole position (bin)
+          [30  : 33]  button position
+          [33  : 36]  target counts  [red, blue, green]
+          [36  : 39]  in-bin counts  [red, blue, green]
+          [39]        current_task_index / 13  (normalised subtask progress)
+
+        Per-colour positions preserve colour identity so the policy can
+        correlate "blue target = 2" with the actual blue cube locations.
+        """
+        out = np.zeros(_SAPIEN_OBJ_STATE_DIM, dtype=np.float32)
+        env = self._inner
+        n = _MAX_CUBES_PER_COLOR
+
+        # Compute offsets from n so the layout stays correct for any value of
+        # _MAX_CUBES_PER_COLOR without touching any other code.
+        _CUBE_BLOCK = n * 3 * 3   # 3 colours × n cubes × 3 xyz
+        _BIN_START     = _CUBE_BLOCK
+        _BUTTON_START  = _BIN_START + 3
+        _TARGET_START  = _BUTTON_START + 3
+        _INBIN_START   = _TARGET_START + 3
+        _TASK_IDX      = _INBIN_START + 3
+
+        # --- per-colour cube positions ---
+        for col_offset, attr in enumerate(("red_cubes", "blue_cubes", "green_cubes")):
+            base = col_offset * n * 3
+            try:
+                cubes = getattr(env, attr, None) or []
+                for i, cube in enumerate(cubes[:n]):
+                    p = np.asarray(cube.pose.p).flatten().astype(np.float32)[:3]
+                    out[base + i * 3: base + i * 3 + 3] = p
+            except Exception:
+                pass
+
+        # --- bin position ---
+        try:
+            p = np.asarray(env.board_with_hole.pose.p).flatten().astype(np.float32)[:3]
+            out[_BIN_START: _BIN_START + 3] = p
+        except Exception:
+            pass
+
+        # --- button position ---
+        try:
+            p = np.asarray(env.button.pose.p).flatten().astype(np.float32)[:3]
+            out[_BUTTON_START: _BUTTON_START + 3] = p
+        except Exception:
+            pass
+
+        # --- target counts [red, blue, green] ---
+        try:
+            out[_TARGET_START]     = float(getattr(env, "red_cubes_target_number", 0))
+            out[_TARGET_START + 1] = float(getattr(env, "blue_cubes_target_number", 0))
+            out[_TARGET_START + 2] = float(getattr(env, "green_cubes_target_number", 0))
+        except Exception:
+            pass
+
+        # --- in-bin counts [red, blue, green] ---
+        try:
+            out[_INBIN_START]     = float(getattr(env, "red_cubes_in_bin", 0))
+            out[_INBIN_START + 1] = float(getattr(env, "blue_cubes_in_bin", 0))
+            out[_INBIN_START + 2] = float(getattr(env, "green_cubes_in_bin", 0))
+        except Exception:
+            pass
+
+        # --- normalised task index ---
+        try:
+            out[_TASK_IDX] = float(getattr(env, "current_task_index", 0)) / 13.0
+        except Exception:
+            pass
+
+        return out
+
     # -----------------------------------------------------------------------
-    # Object-state helpers
+    # Object-state helpers (native-obs based — kept for gymnasium fallback)
     # -----------------------------------------------------------------------
 
     def _raw_obj_obs(self, native_obs) -> np.ndarray:
