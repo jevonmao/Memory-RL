@@ -98,6 +98,7 @@ def evaluate(
 
         obs, info = env.reset(seed=ep)
         state, image = parse_obs(obs)
+        print("initial state:", state[:10])
 
         # -------------------------
         # FIXED HISTORY INIT
@@ -139,10 +140,16 @@ def evaluate(
             # update obs
             state, image = parse_obs(obs)
 
+            if step < 5:
+                print(f"step={step}")
+                print("state[:5] =", state[:5])
+
             history_states.append(state)
             history_images.append(image)
 
             step += 1
+        
+        print("episode length:", step)
 
         success = info.get("success", False)
 
