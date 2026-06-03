@@ -154,3 +154,8 @@ def evaluate(
     print("\n===== FINAL RESULTS =====")
     print(f"Success rate: {success_count / episodes:.3f}")
     print(f"Avg return: {np.mean(returns):.3f}")
+
+if __name__ == "__main__":
+    print("=== Starting evaluation ===")
+    evaluate()
+    print("=== Evaluation finished ===")
