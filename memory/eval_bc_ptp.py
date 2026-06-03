@@ -79,7 +79,7 @@ def parse_obs(obs):
 # Evaluation
 # -----------------------------
 def evaluate(
-    task="PickXtimes",
+    task="BinFill",
     checkpoint="memory/BinFill_bc_best.pt",
     episodes=20,
     history_len=8,
