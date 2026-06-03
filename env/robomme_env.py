@@ -103,9 +103,9 @@ _suppress_mani_skill_noise()
 
 # Reconstruct the ManiSkill physics context every N episodes rather than every
 # reset. Each reconstruction loads a new episode config (object layout) from
-# the demo dataset. N=10 gives ~200 distinct configs over a 10 M-step run
-# while cutting reconstruction overhead by 10x.
-_EPISODE_RELOAD_FREQ = 10
+# the demo dataset. N=20 gives ~100 distinct configs over a 10 M-step run
+# while cutting reconstruction overhead by 20x.
+_EPISODE_RELOAD_FREQ = 20
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +239,9 @@ class RoboMMEEnv(gym.Env):
         episode_kwargs: Optional[Dict[str, Any]] = None,
         subtask_reward: float = 0.0,
         step_penalty: float = 0.0,
+        fail_penalty: float = 1.0,
+        grasp_reward: float = 0.0,
+        cube_in_bin_reward: float = 0.0,
     ):
         super().__init__()
         self.task_name = task_name
@@ -251,10 +254,15 @@ class RoboMMEEnv(gym.Env):
         self._episode_kwargs = dict(episode_kwargs or {})
         self._subtask_reward = float(subtask_reward)
         self._step_penalty = float(step_penalty)
+        self._fail_penalty = float(fail_penalty)
+        self._grasp_reward = float(grasp_reward)
+        self._cube_in_bin_reward = float(cube_in_bin_reward)
         self._next_ep_cursor = 0
         self._episode_num: Optional[int] = None
         self._inner = None          # raw ManiSkill env (unwrapped)
         self._prev_task_index = 0
+        self._prev_grasping = False
+        self._prev_cubes_in_bin = 0
         self._step_count = 0
         self._reset_count = 0
         self._obj_obs_dim = 0       # set below after sampling a native reset()
@@ -509,6 +517,8 @@ class RoboMMEEnv(gym.Env):
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         self._prev_task_index = 0
+        self._prev_grasping = False
+        self._prev_cubes_in_bin = 0
         self._step_count = 0
         self._reset_count += 1
 
@@ -589,6 +599,50 @@ class RoboMMEEnv(gym.Env):
                 reward += self._subtask_reward * (curr_idx - self._prev_task_index)
                 self._prev_task_index = curr_idx
 
+        # +grasp_reward on the transition from not-holding to holding a cube.
+        # Fires once per pick event (not-grasping → grasping), giving dense
+        # signal during the approach/close phase before any subtask reward.
+        #
+        # We query agent.is_grasping(cube) directly rather than reading
+        # env.currentpickup: currentpickup is only cleared inside
+        # is_obj_dropped_currentpickup, which BinFill's "put in bin" task
+        # never calls, so currentpickup stays non-None after the first grasp
+        # and our transition check would never re-fire for subsequent cubes.
+        if self._grasp_reward > 0.0:
+            currently_grasping = self._is_grasping_any_cube()
+            if currently_grasping and not self._prev_grasping:
+                reward += self._grasp_reward
+            self._prev_grasping = currently_grasping
+
+        # +cube_in_bin_reward per cube physically placed in the bin.
+        # Reads the per-colour in-bin counters updated by RoboMME's
+        # is_any_obj_dropped_onto_delete(). Fires on the same step as the
+        # "put it into the bin" subtask reward, providing a physical-state
+        # confirmation signal on top of the task-logic subtask reward.
+        if self._cube_in_bin_reward > 0.0:
+            env = self._inner
+            total_in_bin = (
+                getattr(env, "red_cubes_in_bin", 0)
+                + getattr(env, "blue_cubes_in_bin", 0)
+                + getattr(env, "green_cubes_in_bin", 0)
+            )
+            delta = total_in_bin - self._prev_cubes_in_bin
+            if delta > 0:
+                reward += self._cube_in_bin_reward * delta
+            self._prev_cubes_in_bin = total_in_bin
+
+        # −fail_penalty on task failure — makes deliberate early failing strictly
+        # worse than surviving (0 > −fail_penalty), so the policy cannot exploit
+        # fail-triggers to escape step penalty accumulation.
+        if self._fail_penalty > 0.0:
+            fail_val = info.get("fail")
+            if fail_val is not None:
+                try:
+                    if bool(fail_val.item() if hasattr(fail_val, "item") else fail_val):
+                        reward -= self._fail_penalty
+                except Exception:
+                    pass
+
         # −step_penalty on every step that isn't a true termination (success/fail).
         # Truncation (time limit) still incurs the penalty so that the episode
         # total matches: n_subtasks × subtask_reward − max_steps × step_penalty.
@@ -596,6 +650,26 @@ class RoboMMEEnv(gym.Env):
             reward -= self._step_penalty
 
         return reward
+
+    def _is_grasping_any_cube(self) -> bool:
+        """Return True if the robot is actively grasping any cube right now.
+
+        Mirrors BinFill's is_obj_pickup check: cube z > 0.05 AND
+        agent.is_grasping(cube).  Called once per step so uses try/except
+        rather than per-cube error handling to keep the hot path cheap.
+        """
+        try:
+            env = self._inner
+            cubes = getattr(env, "all_cubes", None)
+            if not cubes:
+                return False
+            for cube in cubes:
+                z = float(np.asarray(cube.pose.p).flatten()[2])
+                if z > 0.05 and bool(env.agent.is_grasping(cube)):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _get_task_index(self, info: Optional[Dict[str, Any]] = None) -> Optional[int]:
         """Read the sequential sub-task counter for dense subtask rewards.

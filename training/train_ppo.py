@@ -105,6 +105,43 @@ def _make_vec_env(task_name, seed, n_envs, allow_gym_fallback, env_kwargs,
         return DummyVecEnv([_thunk(0)])
 
 
+def _bc_compat(ppo_policy, bc_policy) -> str:
+    """Return the transfer mode between a BC checkpoint and the current PPO policy.
+
+    Returns one of:
+      'exact'     – all state-dict shapes match; use load_state_dict directly.
+      'zero_pad'  – obs dims differ but every other layer matches; zero-pad
+                    the input layer columns.
+      'incompatible' – hidden-layer shapes differ (e.g. BC=[64,64], PPO=[256,256]);
+                       no safe transfer possible.
+    """
+    bc_sd = bc_policy.state_dict()
+    ppo_sd = ppo_policy.state_dict()
+    bc_obs_dim = bc_policy.observation_space.shape[0]
+    ppo_obs_dim = ppo_policy.observation_space.shape[0]
+
+    mismatches = []
+    input_layer_keys = []
+    for k, v in bc_sd.items():
+        if k not in ppo_sd:
+            mismatches.append(k)
+            continue
+        ppo_v = ppo_sd[k]
+        if v.shape == ppo_v.shape:
+            continue
+        # Shape mismatch — is this an input-layer column expansion?
+        if v.ndim == 2 and v.shape[1] == bc_obs_dim and ppo_v.shape == (v.shape[0], ppo_obs_dim):
+            input_layer_keys.append(k)
+        else:
+            mismatches.append(f"{k}: BC {tuple(v.shape)} vs PPO {tuple(ppo_v.shape)}")
+
+    if not mismatches and not input_layer_keys:
+        return "exact"
+    if not mismatches and input_layer_keys:
+        return "zero_pad"
+    return "incompatible"
+
+
 def _load_bc_weights_zero_padded(ppo_policy, bc_policy) -> None:
     """Transfer BC weights into a PPO policy whose obs space is wider.
 
@@ -286,18 +323,22 @@ def main():
         bc_model = PPO.load(str(bc_path), device=cfg.get("device", "auto"))
         bc_obs_shape = bc_model.policy.observation_space.shape
         ppo_obs_shape = model.policy.observation_space.shape
-        if bc_obs_shape == ppo_obs_shape:
+        mode = _bc_compat(model.policy, bc_model.policy)
+        if mode == "exact":
             model.policy.load_state_dict(bc_model.policy.state_dict())
-            print("[train_ppo] BC policy weights loaded (obs dims match)")
-        elif len(bc_obs_shape) == 1 and len(ppo_obs_shape) == 1 and ppo_obs_shape[0] > bc_obs_shape[0]:
+            print("[train_ppo] BC policy weights loaded (exact match)")
+        elif mode == "zero_pad":
             _load_bc_weights_zero_padded(model.policy, bc_model.policy)
             print(f"[train_ppo] BC policy weights loaded with zero-padding "
                   f"({bc_obs_shape[0]}-D → {ppo_obs_shape[0]}-D obs); "
                   f"new object-state columns initialised to zero")
         else:
             print(
-                f"[train_ppo] WARNING: BC obs shape {bc_obs_shape} incompatible with "
-                f"env obs shape {ppo_obs_shape} — skipping BC warm-start."
+                f"[train_ppo] WARNING: BC checkpoint architecture is incompatible "
+                f"(BC obs={bc_obs_shape}, PPO obs={ppo_obs_shape}). "
+                f"Most likely the BC model was trained with a different net_arch. "
+                f"Retrain BC with net_arch=[256, 256] to enable warm-starting. "
+                f"Continuing with random init."
             )
         del bc_model
 

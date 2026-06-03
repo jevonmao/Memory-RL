@@ -302,31 +302,19 @@ def train_bc(
     # ---- dataset --------------------------------------------------------------
     dataset = H5BCDataset(h5_path, max_episodes=max_episodes)
 
-    # ---- config ---------------------------------------------------------------
-    cfg = {
-        "policy": "MlpPolicy",
-        "policy_kwargs": {},
-        "learning_rate": 3e-4,
-        "n_steps": 512,
-        "batch_size": 256,
-        "n_epochs": 8,
-        "gamma": 0.99,
-        "gae_lambda": 0.95,
-        "clip_range": 0.2,
-        "ent_coef": 0.0,
-        "vf_coef": 0.5,
-        "max_grad_norm": 0.5,
+    # ---- config (load bc.yaml, then apply CLI overrides) ---------------------
+    from training.utils import load_yaml  # type: ignore
+    cfg = load_yaml("/workspace/configs/bc.yaml")
+    cfg.update({
         "seed": seed,
-        "device": "auto",
-        # BC-specific
         "bc_epochs": bc_epochs,
         "bc_batch_size": bc_batch_size,
         "bc_lr": bc_lr,
         "bc_l2_coef": l2_coef,
-        "bc_log_every": 10,
         "vf_pretrain_epochs": vf_pretrain_epochs,
         "vf_pretrain_lr": bc_lr,
-    }
+        "device": "auto",
+    })
 
     # ---- policy (no SAPIEN / env rollouts needed) -----------------------------
     set_global_seed(seed)
