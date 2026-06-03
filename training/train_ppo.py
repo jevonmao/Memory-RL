@@ -10,6 +10,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import atexit
 import faulthandler
 import json
 import os
@@ -229,6 +230,51 @@ def _run_post_eval(model, cfg, env_kwargs, run_dir):
     print(f"[train_ppo] final eval saved to {metrics_path}")
 
 
+class _Tee:
+    """Mirror writes to both the original stream and a log file.
+
+    Both sys.stdout and sys.stderr are pointed at this wrapper so that
+    everything printed to the terminal is also persisted in train.log.
+    Both streams share the same file handle so output is interleaved
+    correctly without locking.
+    """
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._log.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def _setup_tee_logging(run_dir: Path) -> None:
+    """Redirect stdout and stderr to both terminal and run_dir/train.log.
+
+    The log file name encodes task, seed, and timestamp via the run_dir name:
+        logs/BinFill_seed_1_20260603-123456/train.log
+
+    Uses atexit so the file is closed cleanly on normal exit or uncaught
+    exception, without wrapping all of main() in a try/finally.
+    """
+    log_path = run_dir / "train.log"
+    log_file = open(log_path, "w", buffering=1, encoding="utf-8")
+    tee = _Tee(sys.stdout, log_file)
+    sys.stdout = tee
+    sys.stderr = _Tee(sys.stderr, log_file)
+    atexit.register(log_file.close)
+    # Print to the (now tee'd) stdout so the path appears in both terminal and log.
+    print(f"[train_ppo] logging stdout+stderr → {log_path}", flush=True)
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/ppo.yaml")
@@ -244,15 +290,22 @@ def parse_args():
         "--bc_checkpoint", default=None,
         help="Path to a BC-pretrained .zip to warm-start the PPO policy weights",
     )
+    ap.add_argument(
+        "--wandb_key", default=None,
+        help="W&B API key; sets WANDB_API_KEY for this process only (alternative "
+             "to exporting the env var before running)",
+    )
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.wandb_key:
+        os.environ["WANDB_API_KEY"] = args.wandb_key
     cfg = load_yaml(args.config)
     overrides = {
         k: v for k, v in vars(args).items()
-        if k not in ("config", "tag", "bc_checkpoint") and v is not None
+        if k not in ("config", "tag", "bc_checkpoint", "wandb_key") and v is not None
     }
     cfg = merge_overrides(cfg, overrides)
 
@@ -261,6 +314,7 @@ def main():
     set_global_seed(cfg["seed"], deterministic=cfg.get("deterministic_torch", False))
     run_dir = build_run_dir(cfg["output_dir"], cfg["task_name"], cfg["seed"], tag=args.tag)
     save_run_config(run_dir, cfg)
+    _setup_tee_logging(run_dir)
 
     n_envs = cfg.get("n_envs", 1)
 
