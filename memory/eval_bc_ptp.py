@@ -30,61 +30,99 @@ def select_action(model, states, images, device):
 
 
 # -----------------------------
-# 🔥 ROBUST OBS PARSING (FIXED)
+# OBS INSPECTION (SAFE)
+# -----------------------------
+def debug_obs(obs, once=False):
+    if not once:
+        return
+
+    print("\n===== OBS DEBUG =====")
+    print("type:", type(obs))
+
+    if isinstance(obs, dict):
+        print("keys:", list(obs.keys()))
+        for k in list(obs.keys())[:5]:
+            v = obs[k]
+            print(f"{k}: type={type(v)}, len={len(v) if hasattr(v,'__len__') else 'NA'}")
+
+    else:
+        arr = np.asarray(obs)
+        print("shape:", arr.shape)
+        print("dtype:", arr.dtype)
+        print("first 10:", arr[:10])
+
+
+# -----------------------------
+# STATE EXTRACTION
 # -----------------------------
 def extract_state(obs):
     """
-    Build 1D state vector from RoboMME dict.
+    RoboMME state extractor (robust across configs)
     """
 
+    # flattened env already returns ndarray
     if not isinstance(obs, dict):
         return np.asarray(obs, dtype=np.float32)
 
+    keys = ["eef_state_list", "joint_state_list", "gripper_state_list"]
     parts = []
 
-    for k in ["eef_state_list", "joint_state_list", "gripper_state_list"]:
+    for k in keys:
         if k in obs:
             v = obs[k]
             v = v[-1] if isinstance(v, (list, tuple)) else v
             parts.append(np.asarray(v).flatten())
 
     if len(parts) == 0:
-        raise KeyError(f"[State] No valid keys in obs: {list(obs.keys())}")
+        raise KeyError(f"[State] No valid keys found. Available: {list(obs.keys())}")
 
     return np.concatenate(parts).astype(np.float32)
 
 
+# -----------------------------
+# IMAGE EXTRACTION
+# -----------------------------
 def extract_image(obs):
     """
-    Extract RGB image in CHW format.
+    Extract RGB image (CHW)
     """
 
-    if not isinstance(obs, dict):
-        return np.zeros((3, 64, 64), dtype=np.float32)
+    # fallback dummy
+    fallback = np.zeros((3, 64, 64), dtype=np.float32)
 
-    # try common RoboMME camera keys
-    for k in [
+    if not isinstance(obs, dict):
+        return fallback
+
+    image_keys = [
         "front_rgb_list",
         "rgb_list",
         "camera_rgb_list",
         "image",
-    ]:
+        "rgb",
+    ]
+
+    for k in image_keys:
         if k in obs:
             img = obs[k]
             img = img[-1] if isinstance(img, (list, tuple)) else img
             img = np.asarray(img)
 
+            # handle uint8 images
+            if img.dtype == np.uint8:
+                img = img.astype(np.float32)
+
+            # normalize if needed
+            if img.max() > 1.5:
+                img = img / 255.0
+
             # HWC → CHW
             if img.ndim == 3 and img.shape[-1] == 3:
                 img = np.transpose(img, (2, 0, 1))
 
-            img = img.astype(np.float32)
+            return img.astype(np.float32)
 
-            return img
-
-    # fallback (IMPORTANT: avoid silent failure)
-    print("[WARN] No image found in obs keys:", obs.keys())
-    return np.zeros((3, 64, 64), dtype=np.float32)
+    print("[WARN] No image key found. Available keys:", list(obs.keys()))
+    return fallback
 
 
 def parse_obs(obs):
@@ -92,7 +130,7 @@ def parse_obs(obs):
 
 
 # -----------------------------
-# Evaluation
+# EVALUATION
 # -----------------------------
 def evaluate(
     task="BinFill",
@@ -105,7 +143,8 @@ def evaluate(
     print(f"[INFO] Using device: {device}")
 
     model = load_model(checkpoint, device)
-    # env = make_env(task)
+
+    # IMPORTANT: keep structured obs
     env = make_env(task, env_kwargs={"flatten_obs": False})
 
     success_count = 0
@@ -115,17 +154,16 @@ def evaluate(
 
         obs, info = env.reset(seed=ep)
 
-        # 🔥 DEBUG: dump obs structure ONCE
-        if ep == 0:
-            print(type(obs))
-            print(obs.keys())
+        # debug only first episode
+        debug_obs(obs, once=(ep == 0))
 
         state, image = parse_obs(obs)
 
         print("\ninitial state:", state[:10])
 
-        history_states = [state] * history_len
-        history_images = [image] * history_len
+        # IMPORTANT: avoid aliasing bug
+        history_states = [state.copy() for _ in range(history_len)]
+        history_images = [image.copy() for _ in range(history_len)]
 
         done = False
         total_reward = 0
@@ -152,7 +190,7 @@ def evaluate(
             obs, reward, term, trunc, info = env.step(action)
             done = term or trunc
 
-            total_reward += reward
+            total_reward += float(reward)
 
             state, image = parse_obs(obs)
 
@@ -169,7 +207,7 @@ def evaluate(
         print("episode length:", step)
 
         success = info.get("success", False)
-        success_count += int(success)
+        success_count += int(bool(success))
         returns.append(total_reward)
 
         print(f"[Episode {ep}] success={success} return={total_reward:.3f}")
