@@ -36,7 +36,7 @@ env_kwargs:
 #              8192 steps / 600 max_steps ≈ 13 complete episodes per update  (good diversity)
 #              each env sees ~1.7 complete episodes per rollout  (good advantage estimation)
 # train_ppo.py auto-adjusts batch_size downward if it doesn't divide rollout evenly.
-learning_rate: 3.0e-4       # standard PPO starting point; reduce to 1e-4 if KL diverges
+learning_rate: 1.0e-4       # reduced from 3e-4: clip_fraction 0.43-0.51 and approx_kl 0.05-0.08 indicate updates too aggressive
 n_steps: 1024               # steps per env per update; 8×1024=8192 covers ~13 BinFill episodes
 batch_size: 1024            # 8192/1024 = 8 minibatches; must divide n_envs×n_steps exactly
 n_epochs: 4                 # PPO reuse epochs per rollout; reduce to 4 if approx_kl > 0.02

@@ -178,6 +178,37 @@ def _sanitize_info(info: Any) -> Dict[str, Any]:
     return out
 
 
+def _log_native_obs_structure(native_obs) -> None:
+    """Print the structure of ManiSkill's native obs once at env init.
+
+    Helps diagnose whether object-state information is present and what
+    keys/shapes are available for the _raw_obj_obs extraction.
+    """
+    print("[robomme_env] native obs type:", type(native_obs).__name__, flush=True)
+    if isinstance(native_obs, dict):
+        for k, v in sorted(native_obs.items()):
+            if isinstance(v, dict):
+                print(f"  '{k}': dict with keys:", sorted(v.keys()), flush=True)
+                for k2, v2 in sorted(v.items()):
+                    try:
+                        shape = np.asarray(v2).shape
+                    except Exception:
+                        shape = type(v2).__name__
+                    print(f"    '{k2}': shape={shape}", flush=True)
+            else:
+                try:
+                    shape = np.asarray(v).shape
+                except Exception:
+                    shape = type(v).__name__
+                print(f"  '{k}': shape={shape}", flush=True)
+    else:
+        try:
+            arr = np.asarray(native_obs)
+            print(f"  flat array shape={arr.shape} dtype={arr.dtype}", flush=True)
+        except Exception as e:
+            print(f"  (could not inspect: {e})", flush=True)
+
+
 def list_tasks() -> List[str]:
     robomme = _try_import_robomme()
     if robomme is not None:
@@ -284,6 +315,7 @@ class RoboMMEEnv(gym.Env):
                 low=-10.0, high=10.0, shape=sample_obs.shape, dtype=np.float32
             )
             self.action_space = _action_space_for(action_space)
+            _log_native_obs_structure(_init_native)
 
         self.metadata_info = EnvMetadata(
             task_name=task_name,
