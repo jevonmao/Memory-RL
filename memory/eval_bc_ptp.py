@@ -414,8 +414,11 @@ def _render_frame_from_env(env):
         if frame is None:
             continue
 
-        frame = np.asarray(frame)
+        if isinstance(frame, torch.Tensor):
+            frame = frame.detach().cpu()
+
         frame = _squeeze_batch(frame)
+        frame = np.asarray(frame)
         if frame.ndim != 3:
             continue
         if frame.shape[-1] == 4:
