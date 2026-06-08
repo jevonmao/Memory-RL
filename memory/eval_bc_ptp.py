@@ -381,6 +381,68 @@ def _concat_video_views(base_frame, hand_frame):
     return np.concatenate([base_frame, hand_frame], axis=1)
 
 
+# -----------------------------
+# Video rendering helpers
+# -----------------------------
+def _render_frame_from_env(env):
+    """Render a fresh RGB frame from the live env for visualization videos."""
+    render_targets = []
+    try:
+        render_targets.append(env._inner)
+    except Exception:
+        pass
+    try:
+        render_targets.append(env._inner.unwrapped)
+    except Exception:
+        pass
+    try:
+        render_targets.append(env)
+    except Exception:
+        pass
+
+    for target in render_targets:
+        try:
+            frame = target.render()
+        except TypeError:
+            try:
+                frame = target.render(mode="rgb_array")
+            except Exception:
+                frame = None
+        except Exception:
+            frame = None
+
+        if frame is None:
+            continue
+
+        frame = np.asarray(frame)
+        frame = _squeeze_batch(frame)
+        if frame.ndim != 3:
+            continue
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.shape[-1] != 3:
+            continue
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.float32)
+            if frame.max(initial=0) <= 1.5:
+                frame = frame * 255.0
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame[..., :3]
+
+    return None
+
+
+def _video_frame_from_env_or_obs(env, obs):
+    """Prefer fresh render frames; fallback to obs sensor frames if rendering is unavailable."""
+    frame = _render_frame_from_env(env)
+    if frame is not None:
+        return frame
+
+    base_frame = _raw_rgb_from_obs(obs, "base_camera")
+    hand_frame = _raw_rgb_from_obs(obs, "hand_camera")
+    return _concat_video_views(base_frame, hand_frame)
+
+
 def parse_obs(obs, env=None):
     return extract_state(obs, env=env), extract_image(obs)
 
@@ -729,9 +791,7 @@ def evaluate(
         step = 0
         video_frames = []
         if save_video_dir is not None:
-            base_frame = _raw_rgb_from_obs(obs, "base_camera")
-            hand_frame = _raw_rgb_from_obs(obs, "hand_camera")
-            frame = _concat_video_views(base_frame, hand_frame)
+            frame = _video_frame_from_env_or_obs(env, obs)
             if frame is not None:
                 video_frames.append(frame)
         eef_positions = [state[:3].copy()]
@@ -872,9 +932,7 @@ def evaluate(
                 current_segment_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - task_info["segment_pos"])))
                 current_segment_heights.append(float(task_info["segment_pos"][2]))
             if save_video_dir is not None and video_every > 0 and (step + 1) % video_every == 0:
-                base_frame = _raw_rgb_from_obs(obs, "base_camera")
-                hand_frame = _raw_rgb_from_obs(obs, "hand_camera")
-                frame = _concat_video_views(base_frame, hand_frame)
+                frame = _video_frame_from_env_or_obs(env, obs)
                 if frame is not None:
                     video_frames.append(frame)
 
