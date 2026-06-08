@@ -718,7 +718,7 @@ def evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if checkpoint is None:
-        checkpoint = os.environ.get("CHECKPOINT_PATH", f"/checkpoints/{task}_bc_best.pt")
+        checkpoint = os.environ.get("CHECKPOINT_PATH", f"/checkpoints/{task}_bc_best_0.pt")
 
     if instruction is None:
         # Keep this as None unless the user explicitly provides TASK_INSTRUCTION.

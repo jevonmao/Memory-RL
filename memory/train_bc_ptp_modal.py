@@ -89,7 +89,7 @@ def train_bc_ptp():
         print(f"[Modal] Existing checkpoint/file: {f}", flush=True)
 
     os.environ.setdefault("CHECKPOINT_DIR", str(CHECKPOINT_DIR))
-
+    os.environ.setdefault("CHECKPOINT_VOLUME_NAME", "memory-rl-checkpoints")
     from memory.train_bc_ptp import train
 
     train()
@@ -167,7 +167,7 @@ def list_checkpoints():
 def main_entry():
     print("[Modal] Spawning BC + PTP training as a detached function call...", flush=True)
 
-    call = train_bc_ptp.spawn()
+    call = train_bc_ptp.remote()
 
     print("[Modal] Training spawned successfully.", flush=True)
     print(f"[Modal] Function call id: {call.object_id}", flush=True)

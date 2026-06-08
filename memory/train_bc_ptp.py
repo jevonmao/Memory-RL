@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "data" / "robomme_data_h5" / "record_dataset_BinFill.h5"
 
 TASK_NAME = "BinFill"
-NUM_EPOCHS = 30
+NUM_EPOCHS = 20
 BATCH_SIZE = 8          # parallel episodes
 LR = 1e-4
 HISTORY_LEN = 8
@@ -26,7 +26,9 @@ PTP_WEIGHT = 0.2
 VAL_RATIO = 0.1
 SAVE_EVERY = 5
 GRAD_CLIP_NORM = 1.0
+
 DETACH_MEMORY_EACH_STEP = True
+RESUME_FROM_BEST = True
 
 
 def commit_checkpoint_volume_if_available():
@@ -238,9 +240,29 @@ def train():
         weight_decay=1e-4,
     )
 
-    best_val = float("inf")
+    start_epoch = 0
 
-    for epoch in range(NUM_EPOCHS):
+    best_path = ckpt_dir / f"{TASK_NAME}_bc_best.pt"
+    if RESUME_FROM_BEST and best_path.exists():
+        print(f"[Resume] Loading checkpoint from {best_path}")
+        checkpoint = torch.load(best_path, map_location=device)
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        start_epoch = checkpoint.get("epoch", -1) + 1
+        best_val = checkpoint.get("val_loss", float("inf"))
+
+        print(
+            f"[Resume] Resuming from epoch {start_epoch} "
+            f"with best_val={best_val:.4f}"
+        )
+    else:
+        best_val = float("inf")
+
+    for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         # Keep frozen CLIP encoders in eval mode even after model.train().
         model.vision.eval()
