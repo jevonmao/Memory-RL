@@ -681,6 +681,9 @@ def evaluate(
         eef_positions = [state[:3].copy()]
         joint_positions = [state[6:13].copy()]
         action_norms = []
+        gripper_actions = []
+        gripper_qpos_values = [state[13:15].copy()]
+        gripper_qpos_deltas = []
         memory_norms = []
         memory_delta_norms = []
         prev_memory_for_delta = None
@@ -745,6 +748,8 @@ def evaluate(
             )
             action = np.asarray(action, dtype=np.float32).reshape(-1)
             action_norms.append(float(np.linalg.norm(action)))
+            if action.shape[0] >= 8:
+                gripper_actions.append(float(action[-1]))
             if memory is not None:
                 try:
                     memory_detached = memory.detach()
@@ -785,6 +790,9 @@ def evaluate(
             history_images.append(image.copy())
             eef_positions.append(state[:3].copy())
             joint_positions.append(state[6:13].copy())
+            gripper_qpos_values.append(state[13:15].copy())
+            if len(gripper_qpos_values) >= 2:
+                gripper_qpos_deltas.append(float(np.linalg.norm(gripper_qpos_values[-1] - gripper_qpos_values[-2])))
             progress_positions = _extract_progress_positions(env)
             if "tcp_pos" in progress_positions and "object_pos" in progress_positions:
                 tcp_to_object_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - progress_positions["object_pos"])))
@@ -827,6 +835,12 @@ def evaluate(
         tcp_path_length = float(np.sum(np.linalg.norm(np.diff(eef_positions_arr, axis=0), axis=1))) if len(eef_positions_arr) > 1 else 0.0
         tcp_net_displacement = float(np.linalg.norm(eef_positions_arr[-1] - eef_positions_arr[0])) if len(eef_positions_arr) > 1 else 0.0
         joint_path_length = float(np.sum(np.linalg.norm(np.diff(joint_positions_arr, axis=0), axis=1))) if len(joint_positions_arr) > 1 else 0.0
+        gripper_qpos_arr = np.asarray(gripper_qpos_values, dtype=np.float32)
+        gripper_opening = np.mean(gripper_qpos_arr, axis=1) if gripper_qpos_arr.size else np.asarray([], dtype=np.float32)
+        gripper_initial_opening = float(gripper_opening[0]) if gripper_opening.size else float("nan")
+        gripper_min_opening = float(np.min(gripper_opening)) if gripper_opening.size else float("nan")
+        gripper_final_opening = float(gripper_opening[-1]) if gripper_opening.size else float("nan")
+        gripper_closure = float(gripper_initial_opening - gripper_min_opening) if gripper_opening.size else float("nan")
         demo_normalized_horizon = float(step / 603.0)
         tcp_to_object_summary = _summarize_distance_series(tcp_to_object_dists)
         object_to_goal_summary = _summarize_distance_series(object_to_goal_dists)
@@ -846,6 +860,14 @@ def evaluate(
             "joint_path_length": joint_path_length,
             "mean_action_norm": float(np.mean(action_norms)) if action_norms else 0.0,
             "max_action_norm": float(np.max(action_norms)) if action_norms else 0.0,
+            "mean_gripper_action": float(np.mean(gripper_actions)) if gripper_actions else float("nan"),
+            "min_gripper_action": float(np.min(gripper_actions)) if gripper_actions else float("nan"),
+            "max_gripper_action": float(np.max(gripper_actions)) if gripper_actions else float("nan"),
+            "gripper_initial_opening": gripper_initial_opening,
+            "gripper_min_opening": gripper_min_opening,
+            "gripper_final_opening": gripper_final_opening,
+            "gripper_closure": gripper_closure,
+            "mean_gripper_qpos_delta": float(np.mean(gripper_qpos_deltas)) if gripper_qpos_deltas else float("nan"),
             "mean_memory_norm": float(np.mean(memory_norms)) if memory_norms else float("nan"),
             "max_memory_norm": float(np.max(memory_norms)) if memory_norms else float("nan"),
             "mean_memory_delta_norm": float(np.mean(memory_delta_norms)) if memory_delta_norms else float("nan"),
@@ -869,10 +891,22 @@ def evaluate(
             f"tcp_path={tcp_path_length:.4f} tcp_net={tcp_net_displacement:.4f} "
             f"joint_path={joint_path_length:.4f} mean_action_norm={progress_summary['mean_action_norm']:.4f} "
             f"max_action_norm={progress_summary['max_action_norm']:.4f} "
+            f"grip_action_mean={progress_summary['mean_gripper_action']:.4f} "
+            f"grip_action_min={progress_summary['min_gripper_action']:.4f} "
+            f"grip_action_max={progress_summary['max_gripper_action']:.4f} "
             f"mean_memory_norm={progress_summary['mean_memory_norm']:.4f} "
             f"mean_memory_delta={progress_summary['mean_memory_delta_norm']:.6f} "
             f"max_task_idx={max_task_index_reached} final_task_idx={final_task_index} "
             f"task_transitions={max(0, len(task_transitions) - 1)}",
+            flush=True,
+        )
+        print(
+            f"[Episode {ep}] gripper: "
+            f"opening_initial={gripper_initial_opening:.4f} "
+            f"opening_min={gripper_min_opening:.4f} "
+            f"opening_final={gripper_final_opening:.4f} "
+            f"closure={gripper_closure:.4f} "
+            f"mean_qpos_delta={progress_summary['mean_gripper_qpos_delta']:.6f}",
             flush=True,
         )
         if tcp_to_object_summary is not None:
@@ -941,6 +975,14 @@ def evaluate(
             "joint_path_length",
             "mean_action_norm",
             "max_action_norm",
+            "mean_gripper_action",
+            "min_gripper_action",
+            "max_gripper_action",
+            "gripper_initial_opening",
+            "gripper_min_opening",
+            "gripper_final_opening",
+            "gripper_closure",
+            "mean_gripper_qpos_delta",
             "mean_memory_norm",
             "max_memory_norm",
             "mean_memory_delta_norm",
