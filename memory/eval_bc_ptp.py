@@ -377,6 +377,86 @@ def _pose_position_from_obj(obj):
     return None
 
 
+# -----------------------------
+# RoboMME symbolic task/subgoal helpers
+# -----------------------------
+
+def _extract_unwrapped_env(env):
+    try:
+        return env._inner.unwrapped
+    except Exception:
+        return None
+
+
+def _extract_current_task_info(env):
+    """Extract RoboMME symbolic task/subgoal information when available."""
+    unwrapped = _extract_unwrapped_env(env)
+    if unwrapped is None:
+        return {
+            "task_index": None,
+            "task_name": None,
+            "subgoal": None,
+            "segment_name": None,
+            "segment_pos": None,
+            "num_tasks": None,
+        }
+
+    task_index = getattr(unwrapped, "current_task_index", None)
+    task_name = getattr(unwrapped, "current_task_name_online", None)
+    if task_name is None:
+        task_name = getattr(unwrapped, "current_task_name", None)
+
+    subgoal = getattr(unwrapped, "current_subgoal_segment_online", None)
+    if subgoal is None:
+        subgoal = getattr(unwrapped, "current_subgoal_segment", None)
+
+    task_list = getattr(unwrapped, "task_list", None)
+    num_tasks = len(task_list) if isinstance(task_list, list) else None
+    segment_name = None
+    segment_pos = None
+
+    if isinstance(task_list, list) and task_index is not None:
+        try:
+            task_entry = task_list[int(task_index)]
+            if isinstance(task_entry, dict):
+                segment = task_entry.get("segment")
+                if isinstance(segment, (list, tuple)):
+                    segment_items = segment
+                elif segment is None:
+                    segment_items = []
+                else:
+                    segment_items = [segment]
+                for obj in segment_items:
+                    pos = _pose_position_from_obj(obj)
+                    if pos is not None:
+                        segment_name = getattr(obj, "name", None)
+                        if segment_name is None:
+                            segment_name = getattr(obj, "uid", None)
+                        if segment_name is None:
+                            segment_name = obj.__class__.__name__
+                        segment_pos = pos
+                        break
+        except Exception:
+            pass
+
+    return {
+        "task_index": int(task_index) if task_index is not None else None,
+        "task_name": task_name,
+        "subgoal": subgoal,
+        "segment_name": segment_name,
+        "segment_pos": segment_pos,
+        "num_tasks": num_tasks,
+    }
+
+
+def _select_instruction(base_instruction, env, use_env_subgoal=False):
+    """Choose the language fed to the policy at the current step."""
+    if not use_env_subgoal:
+        return base_instruction
+    task_info = _extract_current_task_info(env)
+    return task_info.get("subgoal") or task_info.get("task_name") or base_instruction
+
+
 def _find_named_position(unwrapped_env, name_patterns):
     """Find the first env attribute whose name contains one of name_patterns and has a pose."""
     if unwrapped_env is None:
@@ -460,6 +540,7 @@ def evaluate(
     render=False,
     max_eval_steps=1000,
     debug_rollout=False,
+    use_env_subgoal_instruction=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -479,6 +560,7 @@ def evaluate(
     print(f"[INFO] Action clip: {action_clip}", flush=True)
     print(f"[INFO] Max eval steps: {max_eval_steps}", flush=True)
     print(f"[INFO] Debug rollout: {debug_rollout}", flush=True)
+    print(f"[INFO] Use env subgoal instruction: {use_env_subgoal_instruction}", flush=True)
 
     model, tokenizer = load_model(checkpoint, device, clip_name=clip_name)
 
@@ -533,6 +615,12 @@ def evaluate(
         tcp_to_object_dists = []
         object_to_goal_dists = []
         object_heights = []
+        current_segment_dists = []
+        current_segment_heights = []
+        task_indices = []
+        task_transitions = []
+        prev_task_index = None
+        prev_task_name = None
         progress_positions = _extract_progress_positions(env)
         object_name = progress_positions.get("object_name")
         goal_name = progress_positions.get("goal_name")
@@ -542,17 +630,34 @@ def evaluate(
             object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
         if "object_pos" in progress_positions:
             object_heights.append(float(progress_positions["object_pos"][2]))
+        task_info = _extract_current_task_info(env)
+        if task_info["task_index"] is not None:
+            task_indices.append(task_info["task_index"])
+            prev_task_index = task_info["task_index"]
+            prev_task_name = task_info["task_name"]
+            task_transitions.append((0, task_info["task_index"], task_info["task_name"], task_info["subgoal"]))
+        if "tcp_pos" in progress_positions and task_info.get("segment_pos") is not None:
+            current_segment_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - task_info["segment_pos"])))
+            current_segment_heights.append(float(task_info["segment_pos"][2]))
         if debug_rollout:
             print(
                 f"[Episode {ep}] progress object={object_name} goal={goal_name} "
                 f"initial_tcp_to_object={tcp_to_object_dists[-1] if tcp_to_object_dists else 'NA'} "
-                f"initial_object_to_goal={object_to_goal_dists[-1] if object_to_goal_dists else 'NA'}",
+                f"initial_object_to_goal={object_to_goal_dists[-1] if object_to_goal_dists else 'NA'} "
+                f"task_index={task_info.get('task_index')} task_name={task_info.get('task_name')} "
+                f"subgoal={task_info.get('subgoal')}",
                 flush=True,
             )
 
         while not done and step < max_eval_steps:
             hs = np.stack(history_states[-history_len:])
             hi = np.stack(history_images[-history_len:])
+
+            step_instruction = _select_instruction(
+                instruction,
+                env,
+                use_env_subgoal=use_env_subgoal_instruction,
+            )
 
             if debug_rollout or step == 0 or (step + 1) % 100 == 0:
                 print(f"[Episode {ep}] step {step}: selecting action", flush=True)
@@ -561,7 +666,7 @@ def evaluate(
                 tokenizer=tokenizer,
                 states=hs,
                 images=hi,
-                instruction=instruction,
+                instruction=step_instruction,
                 device=device,
                 memory=memory,
                 action_clip=action_clip,
@@ -615,6 +720,21 @@ def evaluate(
                 object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
             if "object_pos" in progress_positions:
                 object_heights.append(float(progress_positions["object_pos"][2]))
+            task_info = _extract_current_task_info(env)
+            if task_info["task_index"] is not None:
+                task_indices.append(task_info["task_index"])
+                if task_info["task_index"] != prev_task_index or task_info["task_name"] != prev_task_name:
+                    task_transitions.append((step + 1, task_info["task_index"], task_info["task_name"], task_info["subgoal"]))
+                    print(
+                        f"[Episode {ep}] task transition at step {step + 1}: "
+                        f"idx={task_info['task_index']} name={task_info['task_name']} subgoal={task_info['subgoal']}",
+                        flush=True,
+                    )
+                    prev_task_index = task_info["task_index"]
+                    prev_task_name = task_info["task_name"]
+            if "tcp_pos" in progress_positions and task_info.get("segment_pos") is not None:
+                current_segment_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - task_info["segment_pos"])))
+                current_segment_heights.append(float(task_info["segment_pos"][2]))
 
             step += 1
 
@@ -639,6 +759,10 @@ def evaluate(
         tcp_to_object_summary = _summarize_distance_series(tcp_to_object_dists)
         object_to_goal_summary = _summarize_distance_series(object_to_goal_dists)
         object_height_summary = _summarize_distance_series(object_heights)
+        current_segment_summary = _summarize_distance_series(current_segment_dists)
+        current_segment_height_summary = _summarize_distance_series(current_segment_heights)
+        max_task_index_reached = max(task_indices) if task_indices else -1
+        final_task_index = task_indices[-1] if task_indices else -1
 
         progress_summary = {
             "success": success_bool,
@@ -657,6 +781,11 @@ def evaluate(
             "tcp_to_object": tcp_to_object_summary,
             "object_to_goal": object_to_goal_summary,
             "object_height": object_height_summary,
+            "current_segment": current_segment_summary,
+            "current_segment_height": current_segment_height_summary,
+            "max_task_index_reached": float(max_task_index_reached),
+            "final_task_index": float(final_task_index),
+            "num_task_transitions": float(max(0, len(task_transitions) - 1)),
             "object_name": object_name,
             "goal_name": goal_name,
         }
@@ -669,7 +798,9 @@ def evaluate(
             f"joint_path={joint_path_length:.4f} mean_action_norm={progress_summary['mean_action_norm']:.4f} "
             f"max_action_norm={progress_summary['max_action_norm']:.4f} "
             f"mean_memory_norm={progress_summary['mean_memory_norm']:.4f} "
-            f"mean_memory_delta={progress_summary['mean_memory_delta_norm']:.6f}",
+            f"mean_memory_delta={progress_summary['mean_memory_delta_norm']:.6f} "
+            f"max_task_idx={max_task_index_reached} final_task_idx={final_task_index} "
+            f"task_transitions={max(0, len(task_transitions) - 1)}",
             flush=True,
         )
         if tcp_to_object_summary is not None:
@@ -699,6 +830,31 @@ def evaluate(
                 f"lift={max(object_heights) - object_height_summary['initial']:.4f}",
                 flush=True,
             )
+        if current_segment_summary is not None:
+            print(
+                f"[Episode {ep}] tcp_to_current_segment: "
+                f"initial={current_segment_summary['initial']:.4f} "
+                f"min={current_segment_summary['min']:.4f} "
+                f"final={current_segment_summary['final']:.4f} "
+                f"improvement={current_segment_summary['improvement_initial_minus_min']:.4f}",
+                flush=True,
+            )
+        if current_segment_height_summary is not None:
+            print(
+                f"[Episode {ep}] current_segment_height: "
+                f"initial={current_segment_height_summary['initial']:.4f} "
+                f"max={max(current_segment_heights):.4f} "
+                f"final={current_segment_height_summary['final']:.4f} "
+                f"lift={max(current_segment_heights) - current_segment_height_summary['initial']:.4f}",
+                flush=True,
+            )
+        if task_transitions:
+            print(f"[Episode {ep}] task transitions:", flush=True)
+            for transition_step, transition_idx, transition_name, transition_subgoal in task_transitions:
+                print(
+                    f"  step={transition_step} idx={transition_idx} name={transition_name} subgoal={transition_subgoal}",
+                    flush=True,
+                )
 
     print("\n===== FINAL RESULTS =====", flush=True)
     print(f"Success rate: {success_count / episodes:.3f}", flush=True)
@@ -717,13 +873,16 @@ def evaluate(
             "max_memory_norm",
             "mean_memory_delta_norm",
             "max_memory_delta_norm",
+            "max_task_index_reached",
+            "final_task_index",
+            "num_task_transitions",
         ]:
             vals = np.asarray([s[key] for s in episode_progress_summaries], dtype=np.float32)
             vals = vals[np.isfinite(vals)]
             if vals.size:
                 print(f"{key}: mean={float(np.mean(vals)):.4f} min={float(np.min(vals)):.4f} max={float(np.max(vals)):.4f}", flush=True)
 
-        for dist_key in ["tcp_to_object", "object_to_goal", "object_height"]:
+        for dist_key in ["tcp_to_object", "object_to_goal", "object_height", "current_segment", "current_segment_height"]:
             summaries = [s[dist_key] for s in episode_progress_summaries if s[dist_key] is not None]
             if summaries:
                 for subkey in ["initial", "min", "final", "improvement_initial_minus_min"]:
@@ -743,6 +902,11 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--max-eval-steps", type=int, default=1000)
     parser.add_argument("--debug-rollout", action="store_true")
+    parser.add_argument(
+        "--use-env-subgoal-instruction",
+        action="store_true",
+        help="Use the online RoboMME current subgoal/current task text as the policy instruction at each step.",
+    )
     args = parser.parse_args()
 
     print("=== Starting evaluation ===", flush=True)
@@ -757,5 +921,6 @@ if __name__ == "__main__":
         render=args.render,
         max_eval_steps=args.max_eval_steps,
         debug_rollout=args.debug_rollout,
+        use_env_subgoal_instruction=args.use_env_subgoal_instruction,
     )
     print("=== Evaluation finished ===", flush=True)
