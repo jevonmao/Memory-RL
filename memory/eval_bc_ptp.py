@@ -11,6 +11,11 @@ from .model import CLIPMemoryVLA
 from env.robomme_env import make_env
 
 
+# CLIP normalization constants
+CLIP_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(3, 1, 1)
+CLIP_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(3, 1, 1)
+
+
 # -----------------------------
 # Load model
 # -----------------------------
@@ -275,6 +280,8 @@ def _normalize_image(img):
     if img.ndim != 3 or img.shape[0] != 3:
         raise ValueError(f"[Image] Expected CHW RGB image, got shape {img.shape}")
 
+    img = img.astype(np.float32)
+    img = (img - CLIP_MEAN) / CLIP_STD
     return img.astype(np.float32)
 
 
@@ -384,6 +391,16 @@ def evaluate(
         if debug_rollout:
             print(
                 f"[Episode {ep}] parsed initial obs: state_shape={state.shape} image_shape={image.shape}",
+                flush=True,
+            )
+            print(
+                f"[Episode {ep}] initial state stats: min={float(np.min(state)):.4f} "
+                f"max={float(np.max(state)):.4f} mean={float(np.mean(state)):.4f}",
+                flush=True,
+            )
+            print(
+                f"[Episode {ep}] initial image stats: min={float(np.min(image)):.4f} "
+                f"max={float(np.max(image)):.4f} mean={float(np.mean(image)):.4f}",
                 flush=True,
             )
 
