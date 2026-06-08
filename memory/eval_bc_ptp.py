@@ -449,12 +449,72 @@ def _extract_current_task_info(env):
     }
 
 
+
 def _select_instruction(base_instruction, env, use_env_subgoal=False):
     """Choose the language fed to the policy at the current step."""
     if not use_env_subgoal:
         return base_instruction
     task_info = _extract_current_task_info(env)
     return task_info.get("subgoal") or task_info.get("task_name") or base_instruction
+
+
+# -----------------------------
+# ENV EPISODE INSTRUCTION HELPERS
+# -----------------------------
+def _pluralize_cube(n):
+    return "cube" if int(n) == 1 else "cubes"
+
+
+def _instruction_from_binfill_sequence(sequence):
+    """Build a full BinFill instruction from env.binfill_language_sequence."""
+    if not sequence:
+        return None
+
+    parts = []
+    for color, count in sequence:
+        count = int(count)
+        if count == 1:
+            parts.append(f"one {color} cube")
+        elif count == 2:
+            parts.append(f"two {color} cubes")
+        elif count == 3:
+            parts.append(f"three {color} cubes")
+        else:
+            parts.append(f"{count} {color} cubes")
+
+    if len(parts) == 1:
+        object_phrase = parts[0]
+    elif len(parts) == 2:
+        object_phrase = f"{parts[0]} and {parts[1]}"
+    else:
+        object_phrase = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+    return f"put {object_phrase} into the bin, then press the button to stop"
+
+
+def _extract_env_episode_instruction(env):
+    """Extract or reconstruct the full per-episode language instruction."""
+    unwrapped = _extract_unwrapped_env(env)
+    if unwrapped is None:
+        return None
+
+    for attr in ("task_goal", "language_goal", "goal"):
+        value = getattr(unwrapped, attr, None)
+        if value is None:
+            continue
+        try:
+            arr = np.asarray(value).reshape(-1)
+            if arr.size > 0:
+                value = arr[0]
+        except Exception:
+            pass
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, str):
+            return value
+
+    sequence = getattr(unwrapped, "binfill_language_sequence", None)
+    return _instruction_from_binfill_sequence(sequence)
 
 
 def _find_named_position(unwrapped_env, name_patterns):
@@ -541,6 +601,7 @@ def evaluate(
     max_eval_steps=1000,
     debug_rollout=False,
     use_env_subgoal_instruction=False,
+    use_env_episode_instruction=True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -561,6 +622,7 @@ def evaluate(
     print(f"[INFO] Max eval steps: {max_eval_steps}", flush=True)
     print(f"[INFO] Debug rollout: {debug_rollout}", flush=True)
     print(f"[INFO] Use env subgoal instruction: {use_env_subgoal_instruction}", flush=True)
+    print(f"[INFO] Use env episode instruction: {use_env_episode_instruction}", flush=True)
 
     model, tokenizer = load_model(checkpoint, device, clip_name=clip_name)
 
@@ -575,6 +637,13 @@ def evaluate(
         print(f"[Episode {ep}] reset start", flush=True)
         obs, info = env.reset(seed=ep)
         print(f"[Episode {ep}] reset done info={info}", flush=True)
+
+        episode_instruction = instruction
+        if use_env_episode_instruction and instruction is None:
+            episode_instruction = _extract_env_episode_instruction(env)
+        if episode_instruction is None:
+            episode_instruction = task
+        print(f"[Episode {ep}] instruction: {episode_instruction}", flush=True)
 
         state, image = parse_obs(obs, env=env)
         if debug_rollout:
@@ -654,7 +723,7 @@ def evaluate(
             hi = np.stack(history_images[-history_len:])
 
             step_instruction = _select_instruction(
-                instruction,
+                episode_instruction,
                 env,
                 use_env_subgoal=use_env_subgoal_instruction,
             )
@@ -907,6 +976,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use the online RoboMME current subgoal/current task text as the policy instruction at each step.",
     )
+    parser.add_argument(
+        "--no-env-episode-instruction",
+        action="store_true",
+        help="Disable automatic reconstruction of the per-episode instruction from the online RoboMME env.",
+    )
     args = parser.parse_args()
 
     print("=== Starting evaluation ===", flush=True)
@@ -922,5 +996,6 @@ if __name__ == "__main__":
         max_eval_steps=args.max_eval_steps,
         debug_rollout=args.debug_rollout,
         use_env_subgoal_instruction=args.use_env_subgoal_instruction,
+        use_env_episode_instruction=not args.no_env_episode_instruction,
     )
     print("=== Evaluation finished ===", flush=True)
