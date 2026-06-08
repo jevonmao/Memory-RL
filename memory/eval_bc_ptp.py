@@ -132,21 +132,68 @@ def _squeeze_batch(x):
     return x
 
 
+
 def _flatten_numeric(x):
     return _squeeze_batch(x).astype(np.float32).reshape(-1)
 
 
 # -----------------------------
+# Quaternion and live state helpers
+# -----------------------------
+def _quat_wxyz_to_rpy(q):
+    """Convert quaternion [w, x, y, z] to roll/pitch/yaw."""
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if q.shape[0] != 4:
+        raise ValueError(f"Expected quaternion shape (4,), got {q.shape}")
+    w, x, y, z = q
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = np.sign(sinp) * (np.pi / 2.0)
+    else:
+        pitch = np.arcsin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return np.asarray([roll, pitch, yaw], dtype=np.float32)
+
+
+def _extract_live_eef_state(env):
+    """Extract live TCP pose as [x, y, z, roll, pitch, yaw]."""
+    if env is None:
+        return None
+    try:
+        agent = env._inner.unwrapped.agent
+        raw_pose = agent.tcp_pose.raw_pose
+        raw_pose = _squeeze_batch(raw_pose).reshape(-1)
+        if raw_pose.shape[0] < 7:
+            return None
+        pos = raw_pose[:3].astype(np.float32)
+        quat = raw_pose[3:7]
+        rpy = _quat_wxyz_to_rpy(quat)
+        return np.concatenate([pos, rpy], axis=0).astype(np.float32)
+    except Exception as exc:
+        print(f"[WARN] Failed to extract live TCP pose: {exc}", flush=True)
+        return None
+
+
+# -----------------------------
 # STATE EXTRACTION
 # -----------------------------
-def extract_state(obs):
+def extract_state(obs, env=None):
     """
     Extract a 15D state vector.
 
     Supports both the recorded RoboMME observation format used during offline
     training and the native ManiSkill/RoboMME format returned after bypassing
-    demonstration wrappers. The native format usually has top-level keys like
-    agent/extra/sensor_param/sensor_data.
+    demonstration wrappers. For native live observations, reconstructs the
+    training state as eef_state(6) + joint_state(7) + gripper_state(2).
     """
 
     # flattened env already returns ndarray
@@ -171,16 +218,27 @@ def extract_state(obs):
             raise ValueError(f"[State] Expected state dim 15, got {state.shape[0]}")
         return state
 
-    # Native ManiSkill format. Prefer qpos + qvel because this is consistently
-    # present under obs['agent'] for Panda-style robots. Then pad/truncate to the
-    # 15D state size expected by the BC checkpoint.
+    # Native ManiSkill/RoboMME live format. Reconstruct the same state layout
+    # used during H5 training: eef_state(6) + joint_state(7) + gripper_state(2).
     if "agent" in obs and isinstance(obs["agent"], dict):
-        agent = obs["agent"]
+        agent_obs = obs["agent"]
+        qpos = _flatten_numeric(agent_obs["qpos"]) if "qpos" in agent_obs else None
+        eef_state = _extract_live_eef_state(env)
+        if qpos is not None and eef_state is not None and qpos.shape[0] >= 9:
+            joint_state = qpos[:7].astype(np.float32)
+            gripper_state = qpos[7:9].astype(np.float32)
+            state = np.concatenate([eef_state, joint_state, gripper_state], axis=0).astype(np.float32)
+            if state.shape[0] != 15:
+                raise ValueError(f"[State] Expected reconstructed state dim 15, got {state.shape[0]}")
+            return state
+
+        # Last-resort smoke-test fallback, not faithful to training.
         native_parts = []
         for k in ("qpos", "qvel"):
-            if k in agent:
-                native_parts.append(_flatten_numeric(agent[k]))
+            if k in agent_obs:
+                native_parts.append(_flatten_numeric(agent_obs[k]))
         if native_parts:
+            print("[WARN] Using non-training qpos/qvel state fallback", flush=True)
             state = np.concatenate(native_parts).astype(np.float32)
             if state.shape[0] < 15:
                 state = np.pad(state, (0, 15 - state.shape[0]))
@@ -252,11 +310,11 @@ def extract_image(obs):
     sensor_data = obs.get("sensor_data")
     if isinstance(sensor_data, dict):
         preferred_cameras = [
-            "hand_camera",
             "base_camera",
-            "hand_camera_rgb",
             "front_camera",
             "camera",
+            "hand_camera",
+            "hand_camera_rgb",
         ]
         camera_names = preferred_cameras + [k for k in sensor_data.keys() if k not in preferred_cameras]
         for camera_name in camera_names:
@@ -271,8 +329,8 @@ def extract_image(obs):
     return fallback
 
 
-def parse_obs(obs):
-    return extract_state(obs), extract_image(obs)
+def parse_obs(obs, env=None):
+    return extract_state(obs, env=env), extract_image(obs)
 
 
 # -----------------------------
@@ -322,7 +380,7 @@ def evaluate(
         obs, info = env.reset(seed=ep)
         print(f"[Episode {ep}] reset done info={info}", flush=True)
 
-        state, image = parse_obs(obs)
+        state, image = parse_obs(obs, env=env)
         if debug_rollout:
             print(
                 f"[Episode {ep}] parsed initial obs: state_shape={state.shape} image_shape={image.shape}",
@@ -377,7 +435,7 @@ def evaluate(
 
             total_reward += float(np.asarray(_to_numpy(reward)).reshape(-1)[0])
 
-            state, image = parse_obs(obs)
+            state, image = parse_obs(obs, env=env)
             history_states.append(state.copy())
             history_images.append(image.copy())
 
