@@ -252,8 +252,8 @@ def extract_image(obs):
     sensor_data = obs.get("sensor_data")
     if isinstance(sensor_data, dict):
         preferred_cameras = [
-            "base_camera",
             "hand_camera",
+            "base_camera",
             "hand_camera_rgb",
             "front_camera",
             "camera",
