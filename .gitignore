@@ -20,6 +20,7 @@ wandb/
 *.npz
 results/
 data/data/robomme_data_h5
+memory/checkpoints/BinFill_bc_best_0.pt
 
 # OS / editor
 .DS_Store
@@ -30,3 +31,5 @@ data/data/robomme_data_h5
 # Local secrets
 .env
 *.key
+memory/checkpoints/
+*.pt

@@ -42,6 +42,10 @@ image = (
         "numpy",
         "h5py",
         "wandb",
+        "transformers",
+        "pillow",
+        "ftfy",
+        "regex",
         "tqdm",
     )
     .add_local_dir(
@@ -75,11 +79,16 @@ def train_bc_ptp():
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("[Modal] Starting BC + PTP training...")
-    print(f"[Modal] Checkpoint directory: {CHECKPOINT_DIR}")
+    print("[Modal] Starting BC + PTP training...", flush=True)
+    print(f"[Modal] Checkpoint directory: {CHECKPOINT_DIR}", flush=True)
+    print(f"[Modal] CHECKPOINT_DIR env: {os.environ.get('CHECKPOINT_DIR', '<unset>')}", flush=True)
 
     existing = list(CHECKPOINT_DIR.glob("*"))
-    print(f"[Modal] Existing checkpoints: {len(existing)}")
+    print(f"[Modal] Existing checkpoints: {len(existing)}", flush=True)
+    for f in sorted(existing):
+        print(f"[Modal] Existing checkpoint/file: {f}", flush=True)
+
+    os.environ.setdefault("CHECKPOINT_DIR", str(CHECKPOINT_DIR))
 
     from memory.train_bc_ptp import train
 
@@ -88,9 +97,10 @@ def train_bc_ptp():
     # Persist volume changes
     checkpoint_volume.commit()
 
-    print("\n[Modal] Final checkpoint contents:")
+    print("\n[Modal] Final checkpoint contents:", flush=True)
     for f in sorted(CHECKPOINT_DIR.glob("*")):
-        print(f"  {f}")
+        size = f.stat().st_size if f.is_file() else 0
+        print(f"  {f} size_bytes={size}", flush=True)
 
     return "training finished"
 
@@ -155,8 +165,14 @@ def list_checkpoints():
 # --------------------------------------------------
 @app.local_entrypoint()
 def main_entry():
-    print("[Modal] Launching BC + PTP training...")
+    print("[Modal] Spawning BC + PTP training as a detached function call...", flush=True)
 
-    result = train_bc_ptp.remote()
+    call = train_bc_ptp.spawn()
 
-    print(result)
+    print("[Modal] Training spawned successfully.", flush=True)
+    print(f"[Modal] Function call id: {call.object_id}", flush=True)
+    print("[Modal] You can safely disconnect this terminal now.", flush=True)
+    print("[Modal] To follow logs, run:", flush=True)
+    print(f"  modal app logs {app.name}", flush=True)
+    print("[Modal] To list persisted checkpoints later, run:", flush=True)
+    print("  modal run train_bc_ptp_modal.py::list_checkpoints", flush=True)
