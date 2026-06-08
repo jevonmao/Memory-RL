@@ -528,8 +528,11 @@ def evaluate(
         joint_positions = [state[6:13].copy()]
         action_norms = []
         memory_norms = []
+        memory_delta_norms = []
+        prev_memory_for_delta = None
         tcp_to_object_dists = []
         object_to_goal_dists = []
+        object_heights = []
         progress_positions = _extract_progress_positions(env)
         object_name = progress_positions.get("object_name")
         goal_name = progress_positions.get("goal_name")
@@ -537,6 +540,8 @@ def evaluate(
             tcp_to_object_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - progress_positions["object_pos"])))
         if "object_pos" in progress_positions and "goal_pos" in progress_positions:
             object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
+        if "object_pos" in progress_positions:
+            object_heights.append(float(progress_positions["object_pos"][2]))
         if debug_rollout:
             print(
                 f"[Episode {ep}] progress object={object_name} goal={goal_name} "
@@ -565,10 +570,15 @@ def evaluate(
             action_norms.append(float(np.linalg.norm(action)))
             if memory is not None:
                 try:
-                    memory_norms.append(float(torch.norm(memory.detach()).cpu().item()))
+                    memory_detached = memory.detach()
+                    memory_norms.append(float(torch.norm(memory_detached).cpu().item()))
+                    if prev_memory_for_delta is not None:
+                        memory_delta_norms.append(float(torch.norm(memory_detached.cpu() - prev_memory_for_delta).item()))
+                    prev_memory_for_delta = memory_detached.cpu().clone()
                 except Exception:
                     try:
-                        memory_norms.append(float(torch.norm(memory).detach().cpu().item()))
+                        memory_detached = memory.detach()
+                        memory_norms.append(float(torch.norm(memory_detached).cpu().item()))
                     except Exception:
                         pass
             if debug_rollout or step == 0 or (step + 1) % 100 == 0:
@@ -603,6 +613,8 @@ def evaluate(
                 tcp_to_object_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - progress_positions["object_pos"])))
             if "object_pos" in progress_positions and "goal_pos" in progress_positions:
                 object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
+            if "object_pos" in progress_positions:
+                object_heights.append(float(progress_positions["object_pos"][2]))
 
             step += 1
 
@@ -626,6 +638,7 @@ def evaluate(
         demo_normalized_horizon = float(step / 603.0)
         tcp_to_object_summary = _summarize_distance_series(tcp_to_object_dists)
         object_to_goal_summary = _summarize_distance_series(object_to_goal_dists)
+        object_height_summary = _summarize_distance_series(object_heights)
 
         progress_summary = {
             "success": success_bool,
@@ -639,8 +652,11 @@ def evaluate(
             "max_action_norm": float(np.max(action_norms)) if action_norms else 0.0,
             "mean_memory_norm": float(np.mean(memory_norms)) if memory_norms else float("nan"),
             "max_memory_norm": float(np.max(memory_norms)) if memory_norms else float("nan"),
+            "mean_memory_delta_norm": float(np.mean(memory_delta_norms)) if memory_delta_norms else float("nan"),
+            "max_memory_delta_norm": float(np.max(memory_delta_norms)) if memory_delta_norms else float("nan"),
             "tcp_to_object": tcp_to_object_summary,
             "object_to_goal": object_to_goal_summary,
+            "object_height": object_height_summary,
             "object_name": object_name,
             "goal_name": goal_name,
         }
@@ -652,7 +668,8 @@ def evaluate(
             f"tcp_path={tcp_path_length:.4f} tcp_net={tcp_net_displacement:.4f} "
             f"joint_path={joint_path_length:.4f} mean_action_norm={progress_summary['mean_action_norm']:.4f} "
             f"max_action_norm={progress_summary['max_action_norm']:.4f} "
-            f"mean_memory_norm={progress_summary['mean_memory_norm']:.4f}",
+            f"mean_memory_norm={progress_summary['mean_memory_norm']:.4f} "
+            f"mean_memory_delta={progress_summary['mean_memory_delta_norm']:.6f}",
             flush=True,
         )
         if tcp_to_object_summary is not None:
@@ -673,6 +690,15 @@ def evaluate(
                 f"improvement={object_to_goal_summary['improvement_initial_minus_min']:.4f}",
                 flush=True,
             )
+        if object_height_summary is not None:
+            print(
+                f"[Episode {ep}] object_height({object_name}): "
+                f"initial={object_height_summary['initial']:.4f} "
+                f"max={max(object_heights):.4f} "
+                f"final={object_height_summary['final']:.4f} "
+                f"lift={max(object_heights) - object_height_summary['initial']:.4f}",
+                flush=True,
+            )
 
     print("\n===== FINAL RESULTS =====", flush=True)
     print(f"Success rate: {success_count / episodes:.3f}", flush=True)
@@ -689,13 +715,15 @@ def evaluate(
             "max_action_norm",
             "mean_memory_norm",
             "max_memory_norm",
+            "mean_memory_delta_norm",
+            "max_memory_delta_norm",
         ]:
             vals = np.asarray([s[key] for s in episode_progress_summaries], dtype=np.float32)
             vals = vals[np.isfinite(vals)]
             if vals.size:
                 print(f"{key}: mean={float(np.mean(vals)):.4f} min={float(np.min(vals)):.4f} max={float(np.max(vals)):.4f}", flush=True)
 
-        for dist_key in ["tcp_to_object", "object_to_goal"]:
+        for dist_key in ["tcp_to_object", "object_to_goal", "object_height"]:
             summaries = [s[dist_key] for s in episode_progress_summaries if s[dist_key] is not None]
             if summaries:
                 for subkey in ["initial", "min", "final", "improvement_initial_minus_min"]:
