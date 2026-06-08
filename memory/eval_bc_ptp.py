@@ -287,6 +287,8 @@ def evaluate(
     clip_name="openai/clip-vit-base-patch32",
     action_clip=None,
     render=False,
+    max_eval_steps=200,
+    debug_rollout=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -304,6 +306,8 @@ def evaluate(
     print(f"[INFO] Instruction: {instruction}", flush=True)
     print(f"[INFO] CLIP name: {clip_name}", flush=True)
     print(f"[INFO] Action clip: {action_clip}", flush=True)
+    print(f"[INFO] Max eval steps: {max_eval_steps}", flush=True)
+    print(f"[INFO] Debug rollout: {debug_rollout}", flush=True)
 
     model, tokenizer = load_model(checkpoint, device, clip_name=clip_name)
 
@@ -314,9 +318,16 @@ def evaluate(
     returns = []
 
     for ep in range(episodes):
+        print(f"[Episode {ep}] reset start", flush=True)
         obs, info = env.reset(seed=ep)
+        print(f"[Episode {ep}] reset done info={info}", flush=True)
 
         state, image = parse_obs(obs)
+        if debug_rollout:
+            print(
+                f"[Episode {ep}] parsed initial obs: state_shape={state.shape} image_shape={image.shape}",
+                flush=True,
+            )
 
         # IMPORTANT: avoid aliasing bug
         history_states = [state.copy() for _ in range(history_len)]
@@ -327,10 +338,12 @@ def evaluate(
         total_reward = 0.0
         step = 0
 
-        while not done:
+        while not done and step < max_eval_steps:
             hs = np.stack(history_states[-history_len:])
             hi = np.stack(history_images[-history_len:])
 
+            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+                print(f"[Episode {ep}] step {step}: selecting action", flush=True)
             action, memory = select_action(
                 model=model,
                 tokenizer=tokenizer,
@@ -341,14 +354,28 @@ def evaluate(
                 memory=memory,
                 action_clip=action_clip,
             )
+            action = np.asarray(action, dtype=np.float32).reshape(-1)
+            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+                print(
+                    f"[Episode {ep}] step {step}: action_shape={action.shape} "
+                    f"min={float(np.min(action)):.4f} max={float(np.max(action)):.4f}",
+                    flush=True,
+                )
+                print(f"[Episode {ep}] step {step}: env.step start", flush=True)
 
             obs, reward, term, trunc, info = env.step(action)
-            done = term or trunc
+            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+                print(
+                    f"[Episode {ep}] step {step}: env.step done "
+                    f"reward={reward} term={term} trunc={trunc} info={info}",
+                    flush=True,
+                )
+            done = bool(np.asarray(_to_numpy(term)).any()) or bool(np.asarray(_to_numpy(trunc)).any())
 
             if render and hasattr(env, "render"):
                 env.render()
 
-            total_reward += float(reward)
+            total_reward += float(np.asarray(_to_numpy(reward)).reshape(-1)[0])
 
             state, image = parse_obs(obs)
             history_states.append(state.copy())
@@ -356,13 +383,19 @@ def evaluate(
 
             step += 1
 
+        if step >= max_eval_steps and not done:
+            print(
+                f"[Episode {ep}] reached max_eval_steps={max_eval_steps}; forcing episode stop",
+                flush=True,
+            )
         print(f"episode length: {step}", flush=True)
 
-        success = info.get("success", False)
-        success_count += int(bool(success))
+        success = info.get("success", False) if isinstance(info, dict) else False
+        success_bool = bool(np.asarray(_to_numpy(success)).any())
+        success_count += int(success_bool)
         returns.append(total_reward)
 
-        print(f"[Episode {ep}] success={success} return={total_reward:.3f}", flush=True)
+        print(f"[Episode {ep}] success={success_bool} return={total_reward:.3f}", flush=True)
 
     print("\n===== FINAL RESULTS =====", flush=True)
     print(f"Success rate: {success_count / episodes:.3f}", flush=True)
@@ -379,6 +412,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip-name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--action-clip", type=float, default=None)
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--max-eval-steps", type=int, default=200)
+    parser.add_argument("--debug-rollout", action="store_true")
     args = parser.parse_args()
 
     print("=== Starting evaluation ===", flush=True)
@@ -391,5 +426,7 @@ if __name__ == "__main__":
         clip_name=args.clip_name,
         action_clip=args.action_clip,
         render=args.render,
+        max_eval_steps=args.max_eval_steps,
+        debug_rollout=args.debug_rollout,
     )
     print("=== Evaluation finished ===", flush=True)
