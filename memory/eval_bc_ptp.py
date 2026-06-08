@@ -341,6 +341,112 @@ def parse_obs(obs, env=None):
 
 
 # -----------------------------
+# PROGRESS METRICS HELPERS
+# -----------------------------
+def _safe_scalar_bool(x):
+    return bool(np.asarray(_to_numpy(x)).any())
+
+
+def _safe_scalar_float(x, default=np.nan):
+    try:
+        arr = np.asarray(_to_numpy(x)).reshape(-1)
+        if arr.size == 0:
+            return float(default)
+        return float(arr[0])
+    except Exception:
+        return float(default)
+
+
+def _pose_position_from_obj(obj):
+    """Best-effort extraction of a 3D position from SAPIEN/ManiSkill objects."""
+    if obj is None:
+        return None
+    try:
+        if hasattr(obj, "pose"):
+            pose = obj.pose
+            if hasattr(pose, "p"):
+                return _squeeze_batch(pose.p).reshape(-1)[:3].astype(np.float32)
+            if hasattr(pose, "raw_pose"):
+                return _squeeze_batch(pose.raw_pose).reshape(-1)[:3].astype(np.float32)
+        if hasattr(obj, "p"):
+            return _squeeze_batch(obj.p).reshape(-1)[:3].astype(np.float32)
+        if hasattr(obj, "raw_pose"):
+            return _squeeze_batch(obj.raw_pose).reshape(-1)[:3].astype(np.float32)
+    except Exception:
+        return None
+    return None
+
+
+def _find_named_position(unwrapped_env, name_patterns):
+    """Find the first env attribute whose name contains one of name_patterns and has a pose."""
+    if unwrapped_env is None:
+        return None, None
+    for attr in dir(unwrapped_env):
+        lower = attr.lower()
+        if not any(pat in lower for pat in name_patterns):
+            continue
+        if attr.startswith("__"):
+            continue
+        try:
+            value = getattr(unwrapped_env, attr)
+        except Exception:
+            continue
+        pos = _pose_position_from_obj(value)
+        if pos is not None:
+            return attr, pos
+    return None, None
+
+
+def _extract_progress_positions(env):
+    """Best-effort task progress positions for sparse-reward RoboMME envs.
+
+    Returns a dict containing tcp/object/goal positions when they are available.
+    This is intentionally heuristic because RoboMME task object names differ
+    across tasks.
+    """
+    out = {}
+    try:
+        unwrapped = env._inner.unwrapped
+    except Exception:
+        return out
+
+    eef = _extract_live_eef_state(env)
+    if eef is not None:
+        out["tcp_pos"] = eef[:3]
+
+    obj_name, obj_pos = _find_named_position(
+        unwrapped,
+        ["cube", "obj", "object", "ball", "peg", "button"],
+    )
+    if obj_pos is not None:
+        out["object_name"] = obj_name
+        out["object_pos"] = obj_pos
+
+    goal_name, goal_pos = _find_named_position(
+        unwrapped,
+        ["goal", "target", "bin", "basket", "container"],
+    )
+    if goal_pos is not None:
+        out["goal_name"] = goal_name
+        out["goal_pos"] = goal_pos
+
+    return out
+
+
+def _summarize_distance_series(values):
+    arr = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float32)
+    if arr.size == 0:
+        return None
+    return {
+        "initial": float(arr[0]),
+        "final": float(arr[-1]),
+        "min": float(np.min(arr)),
+        "delta_final_minus_initial": float(arr[-1] - arr[0]),
+        "improvement_initial_minus_min": float(arr[0] - np.min(arr)),
+    }
+
+
+# -----------------------------
 # EVALUATION
 # -----------------------------
 def evaluate(
@@ -381,6 +487,7 @@ def evaluate(
 
     success_count = 0
     returns = []
+    episode_progress_summaries = []
 
     for ep in range(episodes):
         print(f"[Episode {ep}] reset start", flush=True)
@@ -417,12 +524,32 @@ def evaluate(
         done = False
         total_reward = 0.0
         step = 0
+        eef_positions = [state[:3].copy()]
+        joint_positions = [state[6:13].copy()]
+        action_norms = []
+        memory_norms = []
+        tcp_to_object_dists = []
+        object_to_goal_dists = []
+        progress_positions = _extract_progress_positions(env)
+        object_name = progress_positions.get("object_name")
+        goal_name = progress_positions.get("goal_name")
+        if "tcp_pos" in progress_positions and "object_pos" in progress_positions:
+            tcp_to_object_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - progress_positions["object_pos"])))
+        if "object_pos" in progress_positions and "goal_pos" in progress_positions:
+            object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
+        if debug_rollout:
+            print(
+                f"[Episode {ep}] progress object={object_name} goal={goal_name} "
+                f"initial_tcp_to_object={tcp_to_object_dists[-1] if tcp_to_object_dists else 'NA'} "
+                f"initial_object_to_goal={object_to_goal_dists[-1] if object_to_goal_dists else 'NA'}",
+                flush=True,
+            )
 
         while not done and step < max_eval_steps:
             hs = np.stack(history_states[-history_len:])
             hi = np.stack(history_images[-history_len:])
 
-            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+            if debug_rollout or step == 0 or (step + 1) % 100 == 0:
                 print(f"[Episode {ep}] step {step}: selecting action", flush=True)
             action, memory = select_action(
                 model=model,
@@ -435,7 +562,16 @@ def evaluate(
                 action_clip=action_clip,
             )
             action = np.asarray(action, dtype=np.float32).reshape(-1)
-            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+            action_norms.append(float(np.linalg.norm(action)))
+            if memory is not None:
+                try:
+                    memory_norms.append(float(torch.norm(memory.detach()).cpu().item()))
+                except Exception:
+                    try:
+                        memory_norms.append(float(torch.norm(memory).detach().cpu().item()))
+                    except Exception:
+                        pass
+            if debug_rollout or step == 0 or (step + 1) % 100 == 0:
                 print(
                     f"[Episode {ep}] step {step}: action_shape={action.shape} "
                     f"min={float(np.min(action)):.4f} max={float(np.max(action)):.4f}",
@@ -444,22 +580,29 @@ def evaluate(
                 print(f"[Episode {ep}] step {step}: env.step start", flush=True)
 
             obs, reward, term, trunc, info = env.step(action)
-            if debug_rollout or step == 0 or (step + 1) % 25 == 0:
+            if debug_rollout or step == 0 or (step + 1) % 100 == 0:
                 print(
                     f"[Episode {ep}] step {step}: env.step done "
                     f"reward={reward} term={term} trunc={trunc} info={info}",
                     flush=True,
                 )
-            done = bool(np.asarray(_to_numpy(term)).any()) or bool(np.asarray(_to_numpy(trunc)).any())
+            done = _safe_scalar_bool(term) or _safe_scalar_bool(trunc)
 
             if render and hasattr(env, "render"):
                 env.render()
 
-            total_reward += float(np.asarray(_to_numpy(reward)).reshape(-1)[0])
+            total_reward += _safe_scalar_float(reward, default=0.0)
 
             state, image = parse_obs(obs, env=env)
             history_states.append(state.copy())
             history_images.append(image.copy())
+            eef_positions.append(state[:3].copy())
+            joint_positions.append(state[6:13].copy())
+            progress_positions = _extract_progress_positions(env)
+            if "tcp_pos" in progress_positions and "object_pos" in progress_positions:
+                tcp_to_object_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - progress_positions["object_pos"])))
+            if "object_pos" in progress_positions and "goal_pos" in progress_positions:
+                object_to_goal_dists.append(float(np.linalg.norm(progress_positions["object_pos"] - progress_positions["goal_pos"])))
 
             step += 1
 
@@ -471,15 +614,93 @@ def evaluate(
         print(f"episode length: {step}", flush=True)
 
         success = info.get("success", False) if isinstance(info, dict) else False
-        success_bool = bool(np.asarray(_to_numpy(success)).any())
+        success_bool = _safe_scalar_bool(success)
         success_count += int(success_bool)
         returns.append(total_reward)
 
+        eef_positions_arr = np.asarray(eef_positions, dtype=np.float32)
+        joint_positions_arr = np.asarray(joint_positions, dtype=np.float32)
+        tcp_path_length = float(np.sum(np.linalg.norm(np.diff(eef_positions_arr, axis=0), axis=1))) if len(eef_positions_arr) > 1 else 0.0
+        tcp_net_displacement = float(np.linalg.norm(eef_positions_arr[-1] - eef_positions_arr[0])) if len(eef_positions_arr) > 1 else 0.0
+        joint_path_length = float(np.sum(np.linalg.norm(np.diff(joint_positions_arr, axis=0), axis=1))) if len(joint_positions_arr) > 1 else 0.0
+        demo_normalized_horizon = float(step / 603.0)
+        tcp_to_object_summary = _summarize_distance_series(tcp_to_object_dists)
+        object_to_goal_summary = _summarize_distance_series(object_to_goal_dists)
+
+        progress_summary = {
+            "success": success_bool,
+            "return": total_reward,
+            "steps": step,
+            "demo_normalized_horizon": demo_normalized_horizon,
+            "tcp_path_length": tcp_path_length,
+            "tcp_net_displacement": tcp_net_displacement,
+            "joint_path_length": joint_path_length,
+            "mean_action_norm": float(np.mean(action_norms)) if action_norms else 0.0,
+            "max_action_norm": float(np.max(action_norms)) if action_norms else 0.0,
+            "mean_memory_norm": float(np.mean(memory_norms)) if memory_norms else float("nan"),
+            "max_memory_norm": float(np.max(memory_norms)) if memory_norms else float("nan"),
+            "tcp_to_object": tcp_to_object_summary,
+            "object_to_goal": object_to_goal_summary,
+            "object_name": object_name,
+            "goal_name": goal_name,
+        }
+        episode_progress_summaries.append(progress_summary)
+
         print(f"[Episode {ep}] success={success_bool} return={total_reward:.3f}", flush=True)
+        print(
+            f"[Episode {ep}] progress: steps={step} demo_horizon_x={demo_normalized_horizon:.2f} "
+            f"tcp_path={tcp_path_length:.4f} tcp_net={tcp_net_displacement:.4f} "
+            f"joint_path={joint_path_length:.4f} mean_action_norm={progress_summary['mean_action_norm']:.4f} "
+            f"max_action_norm={progress_summary['max_action_norm']:.4f} "
+            f"mean_memory_norm={progress_summary['mean_memory_norm']:.4f}",
+            flush=True,
+        )
+        if tcp_to_object_summary is not None:
+            print(
+                f"[Episode {ep}] tcp_to_object({object_name}): "
+                f"initial={tcp_to_object_summary['initial']:.4f} "
+                f"min={tcp_to_object_summary['min']:.4f} "
+                f"final={tcp_to_object_summary['final']:.4f} "
+                f"improvement={tcp_to_object_summary['improvement_initial_minus_min']:.4f}",
+                flush=True,
+            )
+        if object_to_goal_summary is not None:
+            print(
+                f"[Episode {ep}] object_to_goal({object_name}->{goal_name}): "
+                f"initial={object_to_goal_summary['initial']:.4f} "
+                f"min={object_to_goal_summary['min']:.4f} "
+                f"final={object_to_goal_summary['final']:.4f} "
+                f"improvement={object_to_goal_summary['improvement_initial_minus_min']:.4f}",
+                flush=True,
+            )
 
     print("\n===== FINAL RESULTS =====", flush=True)
     print(f"Success rate: {success_count / episodes:.3f}", flush=True)
     print(f"Avg return: {np.mean(returns):.3f}", flush=True)
+    if episode_progress_summaries:
+        print("\n===== PROGRESS METRICS =====", flush=True)
+        for key in [
+            "steps",
+            "demo_normalized_horizon",
+            "tcp_path_length",
+            "tcp_net_displacement",
+            "joint_path_length",
+            "mean_action_norm",
+            "max_action_norm",
+            "mean_memory_norm",
+            "max_memory_norm",
+        ]:
+            vals = np.asarray([s[key] for s in episode_progress_summaries], dtype=np.float32)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                print(f"{key}: mean={float(np.mean(vals)):.4f} min={float(np.min(vals)):.4f} max={float(np.max(vals)):.4f}", flush=True)
+
+        for dist_key in ["tcp_to_object", "object_to_goal"]:
+            summaries = [s[dist_key] for s in episode_progress_summaries if s[dist_key] is not None]
+            if summaries:
+                for subkey in ["initial", "min", "final", "improvement_initial_minus_min"]:
+                    vals = np.asarray([d[subkey] for d in summaries], dtype=np.float32)
+                    print(f"{dist_key}.{subkey}: mean={float(np.mean(vals)):.4f} min={float(np.min(vals)):.4f} max={float(np.max(vals)):.4f}", flush=True)
 
 
 if __name__ == "__main__":
