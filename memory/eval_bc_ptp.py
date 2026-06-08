@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import numpy as np
+import imageio.v2 as imageio
 from transformers import CLIPModel, CLIPTokenizer
 
 from .model import CLIPMemoryVLA
@@ -336,6 +337,50 @@ def extract_image(obs):
     return fallback
 
 
+def _raw_rgb_from_obs(obs, camera="base_camera"):
+    """Extract raw uint8 HWC RGB frames for visualization videos."""
+    try:
+        if not isinstance(obs, dict):
+            return None
+        sensor_data = obs.get("sensor_data")
+        if not isinstance(sensor_data, dict):
+            return None
+        camera_obs = sensor_data.get(camera)
+        if not isinstance(camera_obs, dict) or "rgb" not in camera_obs:
+            return None
+        img = _squeeze_batch(camera_obs["rgb"])
+        if img.ndim != 3:
+            return None
+        if img.shape[-1] == 4:
+            img = img[..., :3]
+        if img.shape[-1] != 3:
+            return None
+        if img.dtype != np.uint8:
+            img = img.astype(np.float32)
+            if img.max(initial=0) <= 1.5:
+                img = img * 255.0
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return img[..., :3]
+    except Exception:
+        return None
+
+
+def _concat_video_views(base_frame, hand_frame):
+    """Concatenate base and hand camera frames side by side."""
+    if base_frame is None:
+        return hand_frame
+    if hand_frame is None:
+        return base_frame
+
+    if hand_frame.shape[0] != base_frame.shape[0]:
+        pad_h = base_frame.shape[0] - hand_frame.shape[0]
+        if pad_h > 0:
+            hand_frame = np.pad(hand_frame, ((0, pad_h), (0, 0), (0, 0)), mode="constant")
+        elif pad_h < 0:
+            base_frame = np.pad(base_frame, ((0, -pad_h), (0, 0), (0, 0)), mode="constant")
+    return np.concatenate([base_frame, hand_frame], axis=1)
+
+
 def parse_obs(obs, env=None):
     return extract_state(obs, env=env), extract_image(obs)
 
@@ -602,6 +647,8 @@ def evaluate(
     debug_rollout=False,
     use_env_subgoal_instruction=False,
     use_env_episode_instruction=True,
+    save_video_dir=None,
+    video_every=5,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -626,6 +673,8 @@ def evaluate(
     print(f"[INFO] Debug rollout: {debug_rollout}", flush=True)
     print(f"[INFO] Use env subgoal instruction: {use_env_subgoal_instruction}", flush=True)
     print(f"[INFO] Use env episode instruction: {use_env_episode_instruction}", flush=True)
+    print(f"[INFO] Save video dir: {save_video_dir}", flush=True)
+    print(f"[INFO] Video every: {video_every}", flush=True)
 
     model, tokenizer = load_model(checkpoint, device, clip_name=clip_name)
 
@@ -678,6 +727,13 @@ def evaluate(
         done = False
         total_reward = 0.0
         step = 0
+        video_frames = []
+        if save_video_dir is not None:
+            base_frame = _raw_rgb_from_obs(obs, "base_camera")
+            hand_frame = _raw_rgb_from_obs(obs, "hand_camera")
+            frame = _concat_video_views(base_frame, hand_frame)
+            if frame is not None:
+                video_frames.append(frame)
         eef_positions = [state[:3].copy()]
         joint_positions = [state[6:13].copy()]
         action_norms = []
@@ -815,6 +871,12 @@ def evaluate(
             if "tcp_pos" in progress_positions and task_info.get("segment_pos") is not None:
                 current_segment_dists.append(float(np.linalg.norm(progress_positions["tcp_pos"] - task_info["segment_pos"])))
                 current_segment_heights.append(float(task_info["segment_pos"][2]))
+            if save_video_dir is not None and video_every > 0 and (step + 1) % video_every == 0:
+                base_frame = _raw_rgb_from_obs(obs, "base_camera")
+                hand_frame = _raw_rgb_from_obs(obs, "hand_camera")
+                frame = _concat_video_views(base_frame, hand_frame)
+                if frame is not None:
+                    video_frames.append(frame)
 
             step += 1
 
@@ -961,6 +1023,11 @@ def evaluate(
                     f"  step={transition_step} idx={transition_idx} name={transition_name} subgoal={transition_subgoal}",
                     flush=True,
                 )
+        if save_video_dir is not None and video_frames:
+            os.makedirs(os.path.expanduser(save_video_dir), exist_ok=True)
+            video_path = os.path.join(os.path.expanduser(save_video_dir), f"{task}_episode_{ep}.mp4")
+            imageio.mimsave(video_path, video_frames, fps=10)
+            print(f"[Episode {ep}] saved video: {video_path}", flush=True)
 
     print("\n===== FINAL RESULTS =====", flush=True)
     print(f"Success rate: {success_count / episodes:.3f}", flush=True)
@@ -1026,6 +1093,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable automatic reconstruction of the per-episode instruction from the online RoboMME env.",
     )
+    parser.add_argument(
+        "--save-video-dir",
+        type=str,
+        default=None,
+        help="Directory for saving rollout MP4 videos. Each frame is base camera plus hand camera.",
+    )
+    parser.add_argument(
+        "--video-every",
+        type=int,
+        default=5,
+        help="Save one video frame every N env steps.",
+    )
     args = parser.parse_args()
 
     print("=== Starting evaluation ===", flush=True)
@@ -1042,5 +1121,7 @@ if __name__ == "__main__":
         debug_rollout=args.debug_rollout,
         use_env_subgoal_instruction=args.use_env_subgoal_instruction,
         use_env_episode_instruction=not args.no_env_episode_instruction,
+        save_video_dir=args.save_video_dir,
+        video_every=args.video_every,
     )
     print("=== Evaluation finished ===", flush=True)
