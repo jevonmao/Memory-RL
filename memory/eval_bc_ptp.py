@@ -352,7 +352,7 @@ def evaluate(
     clip_name="openai/clip-vit-base-patch32",
     action_clip=None,
     render=False,
-    max_eval_steps=200,
+    max_eval_steps=1000,
     debug_rollout=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -391,6 +391,11 @@ def evaluate(
         if debug_rollout:
             print(
                 f"[Episode {ep}] parsed initial obs: state_shape={state.shape} image_shape={image.shape}",
+                flush=True,
+            )
+            print(
+                f"[Episode {ep}] initial state vector: "
+                f"{np.array2string(state, precision=4, suppress_small=True)}",
                 flush=True,
             )
             print(
@@ -487,7 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--clip-name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--action-clip", type=float, default=None)
     parser.add_argument("--render", action="store_true")
-    parser.add_argument("--max-eval-steps", type=int, default=200)
+    parser.add_argument("--max-eval-steps", type=int, default=1000)
     parser.add_argument("--debug-rollout", action="store_true")
     args = parser.parse_args()
 
