@@ -176,6 +176,7 @@ class RoboMMEEnv(gym.Env):
         flatten_keys: Sequence[str] = _DEFAULT_FLATTEN_KEYS,
         builder_kwargs: Optional[Dict[str, Any]] = None,
         episode_kwargs: Optional[Dict[str, Any]] = None,
+        disable_demonstration_wrapper: Optional[bool] = None,
     ):
         super().__init__()
         self.task_name = task_name
@@ -188,6 +189,10 @@ class RoboMMEEnv(gym.Env):
         self._flattener = _FlattenLatestObs(flatten_keys) if flatten_obs else None
         self._builder_kwargs = dict(builder_kwargs or {})
         self._episode_kwargs = dict(episode_kwargs or {})
+        if disable_demonstration_wrapper is None:
+            env_value = os.environ.get("ROBOMME_DISABLE_DEMO_WRAPPER", "1").strip().lower()
+            disable_demonstration_wrapper = env_value not in {"0", "false", "no", "off"}
+        self._disable_demonstration_wrapper = bool(disable_demonstration_wrapper)
         self._next_ep_cursor = 0
         self._inner = None
         self._builder = None
@@ -218,6 +223,7 @@ class RoboMMEEnv(gym.Env):
                 "dataset": dataset,
                 "action_space": action_space,
                 "episode_num": self._episode_num,
+                "disable_demonstration_wrapper": self._disable_demonstration_wrapper,
             },
         )
 
@@ -259,13 +265,53 @@ class RoboMMEEnv(gym.Env):
             self._next_ep_cursor = (self._next_ep_cursor + 1) % self._episode_num
         return ep
 
+    def _strip_demonstration_wrappers(self, env):
+        """Remove RoboMME wrappers that generate oracle demonstrations on reset.
+
+        RoboMME's DemonstrationWrapper creates an MPLib motion planner inside
+        reset(). On some headless GPU instances this can segfault before the
+        learned policy gets to act. For policy evaluation we only need the
+        fixed-episode environment, not oracle demo generation, so we bypass
+        those wrappers while preserving outer wrappers such as FailAwareWrapper
+        when possible.
+        """
+        if not self._disable_demonstration_wrapper:
+            return env
+
+        demo_wrapper_names = {
+            "DemonstrationWrapper",
+            "EndeffectorDemonstrationWrapper",
+            "MultiStepDemonstrationWrapper",
+            "OraclePlannerDemonstrationWrapper",
+        }
+
+        def is_demo_wrapper(obj) -> bool:
+            return obj.__class__.__name__ in demo_wrapper_names
+
+        # If the top-level env itself is a demo wrapper, drop it.
+        while is_demo_wrapper(env) and hasattr(env, "env"):
+            env = env.env
+
+        # Otherwise walk the Gym wrapper chain and splice demo wrappers out.
+        parent = env
+        seen = set()
+        while hasattr(parent, "env") and id(parent) not in seen:
+            seen.add(id(parent))
+            child = parent.env
+            if is_demo_wrapper(child) and hasattr(child, "env"):
+                parent.env = child.env
+                continue
+            parent = child
+        return env
+
     def _open_new_episode(self, episode_idx: int):
         if hasattr(self._inner, "close"):
             try:
                 self._inner.close()
             except Exception:
                 pass
-        return self._builder.make_env_for_episode(episode_idx, **self._episode_kwargs)
+        env = self._builder.make_env_for_episode(episode_idx, **self._episode_kwargs)
+        return self._strip_demonstration_wrappers(env)
 
     def _infer_dict_space(self, sample: Dict[str, Any]) -> spaces.Dict:
         out: Dict[str, spaces.Space] = {}
