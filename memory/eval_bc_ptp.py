@@ -116,32 +116,108 @@ def select_action(
 # -----------------------------
 # STATE EXTRACTION
 # -----------------------------
+
+def _to_numpy(x):
+    """Convert tensors / arrays / scalars to a CPU numpy array."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _squeeze_batch(x):
+    """Remove leading singleton vector-env batch dimensions."""
+    x = _to_numpy(x)
+    while x.ndim > 1 and x.shape[0] == 1:
+        x = x[0]
+    return x
+
+
+def _flatten_numeric(x):
+    return _squeeze_batch(x).astype(np.float32).reshape(-1)
+
+
+# -----------------------------
+# STATE EXTRACTION
+# -----------------------------
 def extract_state(obs):
     """
-    RoboMME state extractor (robust across configs)
+    Extract a 15D state vector.
+
+    Supports both the recorded RoboMME observation format used during offline
+    training and the native ManiSkill/RoboMME format returned after bypassing
+    demonstration wrappers. The native format usually has top-level keys like
+    agent/extra/sensor_param/sensor_data.
     """
 
     # flattened env already returns ndarray
     if not isinstance(obs, dict):
-        return np.asarray(obs, dtype=np.float32)
+        state = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if state.shape[0] != 15:
+            raise ValueError(f"[State] Expected state dim 15, got {state.shape[0]}")
+        return state
 
+    # Offline / recorded RoboMME format.
     keys = ["eef_state_list", "joint_state_list", "gripper_state_list"]
     parts = []
-
     for k in keys:
         if k in obs:
             v = obs[k]
             v = v[-1] if isinstance(v, (list, tuple)) else v
             parts.append(np.asarray(v).flatten())
 
-    if len(parts) == 0:
-        raise KeyError(f"[State] No valid keys found. Available: {list(obs.keys())}")
+    if parts:
+        state = np.concatenate(parts).astype(np.float32)
+        if state.shape[0] != 15:
+            raise ValueError(f"[State] Expected state dim 15, got {state.shape[0]}")
+        return state
 
-    state = np.concatenate(parts).astype(np.float32)
-    if state.shape[0] != 15:
-        raise ValueError(f"[State] Expected state dim 15, got {state.shape[0]}")
+    # Native ManiSkill format. Prefer qpos + qvel because this is consistently
+    # present under obs['agent'] for Panda-style robots. Then pad/truncate to the
+    # 15D state size expected by the BC checkpoint.
+    if "agent" in obs and isinstance(obs["agent"], dict):
+        agent = obs["agent"]
+        native_parts = []
+        for k in ("qpos", "qvel"):
+            if k in agent:
+                native_parts.append(_flatten_numeric(agent[k]))
+        if native_parts:
+            state = np.concatenate(native_parts).astype(np.float32)
+            if state.shape[0] < 15:
+                state = np.pad(state, (0, 15 - state.shape[0]))
+            elif state.shape[0] > 15:
+                state = state[:15]
+            return state
 
-    return state
+    raise KeyError(f"[State] No valid keys found. Available: {list(obs.keys())}")
+
+
+# -----------------------------
+# IMAGE EXTRACTION
+# -----------------------------
+
+def _normalize_image(img):
+    img = _squeeze_batch(img)
+
+    # Some ManiSkill camera tensors have shape HWC, BHWC, CHW, or BCHW. After
+    # squeezing singleton batch dims above, convert HWC to CHW.
+    if img.dtype == np.uint8:
+        img = img.astype(np.float32)
+    else:
+        img = img.astype(np.float32)
+
+    if img.max(initial=0) > 1.5:
+        img = img / 255.0
+
+    if img.ndim == 3 and img.shape[-1] == 4:
+        img = img[..., :3]
+
+    if img.ndim == 3 and img.shape[-1] == 3:
+        img = np.transpose(img, (2, 0, 1))
+
+    if img.ndim != 3 or img.shape[0] != 3:
+        raise ValueError(f"[Image] Expected CHW RGB image, got shape {img.shape}")
+
+    return img.astype(np.float32)
 
 
 # -----------------------------
@@ -157,6 +233,7 @@ def extract_image(obs):
     if not isinstance(obs, dict):
         return fallback
 
+    # Offline / recorded RoboMME format.
     image_keys = [
         "front_rgb_list",
         "rgb_list",
@@ -169,22 +246,26 @@ def extract_image(obs):
         if k in obs:
             img = obs[k]
             img = img[-1] if isinstance(img, (list, tuple)) else img
-            img = np.asarray(img)
+            return _normalize_image(img)
 
-            if img.dtype == np.uint8:
-                img = img.astype(np.float32)
-
-            if img.max() > 1.5:
-                img = img / 255.0
-
-            # HWC -> CHW
-            if img.ndim == 3 and img.shape[-1] == 3:
-                img = np.transpose(img, (2, 0, 1))
-
-            if img.ndim != 3 or img.shape[0] != 3:
-                raise ValueError(f"[Image] Expected CHW RGB image, got shape {img.shape}")
-
-            return img.astype(np.float32)
+    # Native ManiSkill format: obs['sensor_data'][camera_name]['rgb'].
+    sensor_data = obs.get("sensor_data")
+    if isinstance(sensor_data, dict):
+        preferred_cameras = [
+            "base_camera",
+            "hand_camera",
+            "hand_camera_rgb",
+            "front_camera",
+            "camera",
+        ]
+        camera_names = preferred_cameras + [k for k in sensor_data.keys() if k not in preferred_cameras]
+        for camera_name in camera_names:
+            camera_obs = sensor_data.get(camera_name)
+            if not isinstance(camera_obs, dict):
+                continue
+            for image_key in ("rgb", "Color", "color", "image"):
+                if image_key in camera_obs:
+                    return _normalize_image(camera_obs[image_key])
 
     print("[WARN] No image key found. Available keys:", list(obs.keys()), flush=True)
     return fallback
