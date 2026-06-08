@@ -609,14 +609,17 @@ def evaluate(
         checkpoint = os.environ.get("CHECKPOINT_PATH", f"/checkpoints/{task}_bc_best.pt")
 
     if instruction is None:
-        instruction = os.environ.get("TASK_INSTRUCTION", task)
+        # Keep this as None unless the user explicitly provides TASK_INSTRUCTION.
+        # This allows per-episode instructions to be reconstructed from the env
+        # after reset, which is important because BinFill goals vary by episode.
+        instruction = os.environ.get("TASK_INSTRUCTION", None)
 
     print(f"[INFO] Using device: {device}", flush=True)
     print(f"[INFO] Task: {task}", flush=True)
     print(f"[INFO] Checkpoint: {checkpoint}", flush=True)
     print(f"[INFO] Episodes: {episodes}", flush=True)
     print(f"[INFO] History len: {history_len}", flush=True)
-    print(f"[INFO] Instruction: {instruction}", flush=True)
+    print(f"[INFO] Instruction override: {instruction}", flush=True)
     print(f"[INFO] CLIP name: {clip_name}", flush=True)
     print(f"[INFO] Action clip: {action_clip}", flush=True)
     print(f"[INFO] Max eval steps: {max_eval_steps}", flush=True)
